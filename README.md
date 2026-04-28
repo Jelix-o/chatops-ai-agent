@@ -1,0 +1,324 @@
+# NapCat QQ 群聊 Skill AI 机器人
+
+这是一个基于 `NapCat + OneBot + Node.js + TypeScript` 的 QQ 群聊机器人项目，适合和 NapCat 部署在同一台 Windows 机器上使用。
+
+它已经支持：
+
+- 群内 `@机器人` 才触发对话
+- 多 skill 切换
+- 图片理解
+- MiMo TTS 语音回复
+- 实时对话
+- 群聊日报
+- 中国节假日倒计时
+- 群管理员 / 超级管理员权限体系
+
+## 功能概览
+
+- 普通成员可直接使用：
+  - `@机器人 <内容>`
+  - `#语音 <内容>`
+  - `@机器人 语音说 <内容>`
+  - `#功能`
+  - `#技能 列表`
+  - `#日报 状态`
+  - `#节假日`
+- 群管理员可使用全部系统指令：
+  - skill 切换
+  - 实时对话管理
+  - 日报配置
+  - 节假日倒计时配置
+  - 查看管理员列表
+- 超级管理员额外可使用：
+  - `#管理员 添加 <QQ号>`
+  - `#管理员 移除 <QQ号>`
+
+## 目录结构
+
+- `src/`：项目源码
+- `skills/`：技能人格配置
+- `config/groups.json`：群配置、管理员配置、超级管理员配置
+- `data/conversations.json`：群聊上下文
+- `data/daily-report-store.json`：日报发送状态
+- `data/holiday-countdown-store.json`：节假日倒计时发送状态
+- `COMMANDS.md`：系统全部指令说明
+- `.env.example`：通用环境变量模板
+- `.env.server-2022.example`：Windows Server 2022 模板
+
+## 安装依赖
+
+```bash
+pnpm install
+```
+
+如果你用 `npm` 也可以：
+
+```bash
+npm install
+```
+
+## 本地开发
+
+```bash
+pnpm run dev
+```
+
+## 构建与运行
+
+```bash
+pnpm run build
+pnpm start
+```
+
+## 环境变量
+
+先复制模板：
+
+```bash
+copy .env.example .env
+```
+
+或服务器环境：
+
+```bash
+copy .env.server-2022.example .env
+```
+
+然后按文件内注释填写。
+
+重点变量：
+
+- `NAPCAT_MODE`
+  - `forward`：机器人主动连 NapCat
+  - `reverse`：NapCat 主动连机器人
+- `NAPCAT_WS_URL`
+  - 正向 WebSocket 地址
+- `NAPCAT_ACCESS_TOKEN`
+  - NapCat 访问令牌
+- `NAPCAT_REVERSE_WS_HOST`
+  - 反向 WebSocket 监听地址
+- `NAPCAT_REVERSE_WS_PORT`
+  - 反向 WebSocket 监听端口
+- `NAPCAT_REVERSE_WS_PATH`
+  - 反向 WebSocket 路径
+- `OPENAI_BASE_URL`
+  - 文本模型兼容接口地址
+- `OPENAI_API_KEY`
+  - 文本模型密钥
+- `OPENAI_MODEL`
+  - 文本模型名
+- `TTS_BASE_URL`
+  - 语音合成接口地址
+- `TTS_API_KEY`
+  - 语音合成密钥
+- `TTS_MODEL`
+  - 默认语音模型
+- `TTS_VOICE`
+  - 默认音色
+- `TTS_AUDIO_FORMAT`
+  - 语音输出格式，默认 `wav`
+- `TTS_STYLE_HINT`
+  - 全局附加语音风格提示，可留空
+- `TTS_ALLOW_NAPCAT_AI_FALLBACK`
+  - TTS 失败时是否允许回退 NapCat AI 语音
+- `BOT_QQ`
+  - 机器人自己的 QQ 号
+
+## 群配置文件
+
+配置文件路径：
+
+- [`config/groups.json`](/D:/development/AI-Project/config/groups.json)
+
+示例结构：
+
+```json
+{
+  "superAdminUserIds": ["1569671790"],
+  "groups": [
+    {
+      "groupId": "866209871",
+      "currentSkillId": "zxp",
+      "allowedSkillIds": ["leijun", "zxp", "jackma"],
+      "switcherUserIds": ["1569671790"],
+      "liveChatUserIds": ["2684837849"],
+      "liveChatDelayMinutes": 1,
+      "dailyReportEnabled": true,
+      "dailyReportTime": "17:59",
+      "dailyReportTopUserCount": 5,
+      "holidayCountdownEnabled": true,
+      "holidayCountdownTime": "09:00"
+    }
+  ]
+}
+```
+
+字段说明：
+
+- `superAdminUserIds`
+  - 全局超级管理员 QQ 列表
+  - 超级管理员拥有所有系统权限
+  - 只有超级管理员可以增删群管理员
+- `groupId`
+  - 机器人允许工作的群号
+- `currentSkillId`
+  - 当前群默认 skill
+- `allowedSkillIds`
+  - 本群允许切换的 skill 列表
+- `switcherUserIds`
+  - 本群管理员 QQ 列表
+  - 这是历史字段名，现在语义上等同“群管理员”
+- `liveChatUserIds`
+  - 开启实时对话跟踪的 QQ 列表
+- `liveChatDelayMinutes`
+  - 机器人最后一次发言后，需要安静多久才允许实时对话触发
+- `dailyReportEnabled`
+  - 是否开启日报
+- `dailyReportTime`
+  - 工作日自动发送日报的时间
+- `dailyReportTopUserCount`
+  - 日报里统计的活跃用户数量
+- `holidayCountdownEnabled`
+  - 是否开启节假日倒计时
+- `holidayCountdownTime`
+  - 每天自动发送节假日倒计时的时间
+
+## NapCat 接入
+
+### 正向 WebSocket
+
+适合机器人主动去连 NapCat：
+
+```env
+NAPCAT_MODE=forward
+NAPCAT_WS_URL=ws://127.0.0.1:3001
+```
+
+### 反向 WebSocket
+
+适合 NapCat 主动连接机器人，推荐你现在这种部署方式：
+
+```env
+NAPCAT_MODE=reverse
+NAPCAT_REVERSE_WS_HOST=127.0.0.1
+NAPCAT_REVERSE_WS_PORT=6199
+NAPCAT_REVERSE_WS_PATH=/onebot/ws
+NAPCAT_ACCESS_TOKEN=你的token
+```
+
+NapCat 里对应填写：
+
+- URL：`ws://127.0.0.1:6199/onebot/ws`
+- Token：和 `NAPCAT_ACCESS_TOKEN` 保持一致
+
+注意：
+
+- 不要把 NapCat WebUI 调试页的 `/api/Debug/ws` 当正式运行地址
+- WebUI 调试页只适合手工联调，不适合作为机器人长期接入地址
+
+## Skill 配置
+
+每个 skill 位于 `skills/*.json`
+
+至少需要这些字段：
+
+- `id`
+- `name`
+- `systemPrompt`
+- `styleRules`
+- `knowledge`
+- `temperature`
+- `maxContextTurns`
+
+可选增强字段：
+
+- `ttsStyleHint`
+- `exampleExchanges`
+- `maxReplyCharsPerMessage`
+- `maxTotalReplyChars`
+- `maxReplyMessages`
+- `preferredMaxReplyMessages`
+- `allowBurstOnHighEmotion`
+- `highEmotionKeywords`
+
+## 系统指令
+
+完整指令清单请看：
+
+- [`COMMANDS.md`](/D:/development/AI-Project/COMMANDS.md)
+
+常用指令速览：
+
+- `#功能`
+- `#技能 列表`
+- `#技能 切换 <skillId>`
+- `#语音 <内容>`
+- `#实时对话 列表`
+- `#实时对话 添加 <QQ号>`
+- `#日报 状态`
+- `#节假日`
+- `#管理员 列表`
+
+## Windows Server 2022 部署
+
+推荐流程：
+
+1. 安装 Node.js 22
+2. 安装 NapCat，并确认 QQ 已登录
+3. 上传或解压本项目到固定目录
+4. 复制环境变量模板为 `.env`
+5. 填写 `.env`
+6. 修改 `config/groups.json`
+7. 安装依赖并构建
+8. 启动项目
+
+示例：
+
+```bat
+cd /d D:\apps\napcat-qq-skill-bot
+pnpm install
+pnpm run build
+pnpm start
+```
+
+## Windows 打包
+
+```bash
+pnpm run package:win
+```
+
+输出位置：
+
+- `release/<项目名>-<版本>-win/`
+- `release/<项目名>-<版本>-win.zip`
+
+## 开机自启
+
+注册：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\register-startup-task.ps1
+```
+
+取消：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\unregister-startup-task.ps1
+```
+
+## 测试
+
+```bash
+pnpm test
+```
+
+## 分享项目给别人
+
+如果你要把项目发给别人，建议不要直接发正在运行的目录。
+
+推荐发脱敏分享包：
+
+- [分享包目录](/D:/development/AI-Project/share/napcat-qq-skill-bot-share)
+- [分享包压缩文件](/D:/development/AI-Project/share/napcat-qq-skill-bot-share.zip)
+
+这样不会带上你的真实 `.env`、API Key、对话历史和生产群配置。

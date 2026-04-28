@@ -1,0 +1,64 @@
+import path from "node:path";
+import dotenv from "dotenv";
+
+import type { AppConfig } from "./types.js";
+
+dotenv.config();
+
+function requireEnv(name: string): string {
+  const value = process.env[name];
+  if (!value) {
+    throw new Error(`Missing required environment variable: ${name}`);
+  }
+  return value;
+}
+
+export function loadConfig(): AppConfig {
+  const cwd = process.cwd();
+  const napcatMode = (process.env.NAPCAT_MODE ?? "forward").trim().toLowerCase();
+  const reversePort = Number(process.env.NAPCAT_REVERSE_WS_PORT ?? "6199");
+  const openAiBaseUrl = requireEnv("OPENAI_BASE_URL");
+  const openAiApiKey = requireEnv("OPENAI_API_KEY");
+  const ttsAudioFormat = (process.env.TTS_AUDIO_FORMAT ?? "wav").trim().toLowerCase();
+  const ttsAllowNapCatAiFallback =
+    (process.env.TTS_ALLOW_NAPCAT_AI_FALLBACK ?? "false").trim().toLowerCase() === "true";
+  const napcatWsUrl =
+    napcatMode === "forward"
+      ? requireEnv("NAPCAT_WS_URL")
+      : process.env.NAPCAT_WS_URL ?? "ws://127.0.0.1:3001";
+  if (napcatMode !== "forward" && napcatMode !== "reverse") {
+    throw new Error("NAPCAT_MODE must be either 'forward' or 'reverse'.");
+  }
+  if (!Number.isFinite(reversePort) || reversePort <= 0 || reversePort > 65535) {
+    throw new Error("NAPCAT_REVERSE_WS_PORT must be a valid TCP port (1-65535).");
+  }
+  if (!["wav", "mp3", "pcm", "pcm16"].includes(ttsAudioFormat)) {
+    throw new Error("TTS_AUDIO_FORMAT must be one of 'wav', 'mp3', 'pcm', or 'pcm16'.");
+  }
+
+  return {
+    napcatMode,
+    napcatWsUrl,
+    napcatAccessToken: process.env.NAPCAT_ACCESS_TOKEN,
+    napcatReverseWsHost: process.env.NAPCAT_REVERSE_WS_HOST ?? "127.0.0.1",
+    napcatReverseWsPort: reversePort,
+    napcatReverseWsPath: process.env.NAPCAT_REVERSE_WS_PATH ?? "/onebot/ws",
+    openAiBaseUrl,
+    openAiApiKey,
+    openAiModel: requireEnv("OPENAI_MODEL"),
+    ttsBaseUrl: process.env.TTS_BASE_URL ?? openAiBaseUrl,
+    ttsApiKey: process.env.TTS_API_KEY ?? openAiApiKey,
+    ttsModel: process.env.TTS_MODEL ?? "mimo-v2-tts",
+    ttsVoice: process.env.TTS_VOICE ?? "mimo_default",
+    ttsAudioFormat: ttsAudioFormat as AppConfig["ttsAudioFormat"],
+    ttsStyleHint: process.env.TTS_STYLE_HINT?.trim() || undefined,
+    ttsAllowNapCatAiFallback,
+    ttsCacheDir: path.join(cwd, "data", "tts-cache"),
+    botQq: requireEnv("BOT_QQ"),
+    groupsConfigPath: path.join(cwd, "config", "groups.json"),
+    skillsDir: path.join(cwd, "skills"),
+    conversationsPath: path.join(cwd, "data", "conversations.json"),
+    dailyReportStorePath: path.join(cwd, "data", "daily-report-store.json"),
+    holidayCountdownStorePath: path.join(cwd, "data", "holiday-countdown-store.json"),
+  };
+}
