@@ -39,7 +39,7 @@ export class ConversationStore {
 
   private async readData(): Promise<ConversationsFile> {
     try {
-      return await readJsonFile<ConversationsFile>(this.filePath);
+      return normalizeConversationsFile(await readJsonFile<ConversationsFile>(this.filePath));
     } catch (error) {
       const knownError = error as NodeJS.ErrnoException;
       if (knownError.code === "ENOENT") {
@@ -53,4 +53,12 @@ export class ConversationStore {
     await mkdir(path.dirname(this.filePath), { recursive: true });
     await writeFile(this.filePath, `${JSON.stringify(data, null, 2)}\n`, "utf8");
   }
+}
+
+function normalizeConversationsFile(data: Partial<ConversationsFile>): ConversationsFile {
+  if (!data || typeof data.conversations !== "object" || data.conversations === null) {
+    return { conversations: {} };
+  }
+
+  return { conversations: data.conversations };
 }
