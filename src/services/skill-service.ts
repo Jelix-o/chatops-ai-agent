@@ -5,6 +5,8 @@ import type { SkillDefinition } from "../types.js";
 import { readJsonFile } from "../utils/json-file.js";
 
 export class SkillService {
+  private cachedSkills?: SkillDefinition[];
+
   constructor(private readonly skillsDir: string) {}
 
   async getSkill(skillId: string): Promise<SkillDefinition | undefined> {
@@ -13,6 +15,10 @@ export class SkillService {
   }
 
   async getAllSkills(): Promise<SkillDefinition[]> {
+    if (this.cachedSkills) {
+      return this.cachedSkills;
+    }
+
     const files = await readdir(this.skillsDir, { withFileTypes: true });
     const jsonFiles = files.filter((entry) => entry.isFile() && entry.name.endsWith(".json"));
 
@@ -23,6 +29,7 @@ export class SkillService {
       }),
     );
 
-    return skills.sort((left, right) => left.name.localeCompare(right.name, "zh-Hans-CN"));
+    this.cachedSkills = skills.sort((left, right) => left.name.localeCompare(right.name, "zh-Hans-CN"));
+    return this.cachedSkills;
   }
 }

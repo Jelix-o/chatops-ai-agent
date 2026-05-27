@@ -60,5 +60,6 @@ export function loadConfig(): AppConfig {
     conversationsPath: path.join(cwd, "data", "conversations.json"),
     dailyReportStorePath: path.join(cwd, "data", "daily-report-store.json"),
     holidayCountdownStorePath: path.join(cwd, "data", "holiday-countdown-store.json"),
+    scheduledReminderStorePath: path.join(cwd, "data", "scheduled-reminders.json"),
   };
 }

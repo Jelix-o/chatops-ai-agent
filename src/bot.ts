@@ -6,13 +6,20 @@ import type { GroupConfigService } from "./services/group-config-service.js";
 import type { GroupLock } from "./services/group-lock.js";
 import type { HolidayCountdownService } from "./services/holiday-countdown-service.js";
 import type { BufferedMessage, LiveChatService } from "./services/live-chat-service.js";
+import type { ScheduledReminderService } from "./services/scheduled-reminder-service.js";
+import { formatIntervalLabel, isWithinWorkHours } from "./services/scheduled-reminder-service.js";
 import type { SkillService } from "./services/skill-service.js";
 import type { TtsService } from "./services/tts-service.js";
 import type {
+  AiInteractionTarget,
+  AiReplyContext,
+  ControlledMentionDecision,
   ConversationTurn,
+  GroupMemberIdentity,
   GroupBotConfig,
   MessageImageInput,
   NapcatGroupMessageEvent,
+  ReferencedMessage,
   SkillDefinition,
 } from "./types.js";
 import { parseChatSummaryRequest } from "./utils/chat-summary-request.js";
@@ -22,26 +29,36 @@ import { parseVoiceCommand } from "./utils/voice-command.js";
 
 const SKILL_PREFIX = "#技能";
 const VOICE_PREFIX = "#语音";
+const CONVERSATION_PREFIX = "#对话";
 const LIVE_CHAT_PREFIX = "#实时对话";
 const DAILY_REPORT_PREFIX = "#日报";
 const HOLIDAY_COUNTDOWN_PREFIX = "#节假日";
+const SCHEDULED_REMINDER_PREFIX = "#定时任务";
 const ADMIN_PREFIX = "#管理员";
+const MUTE_COMMAND = "#闭嘴";
+const UNMUTE_COMMAND = "#说话";
+const CLEAR_GROUP_CONTEXT_COMMAND = "#clear";
 const HELP_PREFIXES = ["#功能", "#帮助", "#命令"];
 const LIVE_CHAT_TICK_MS = 15 * 1000;
 const DAILY_REPORT_TICK_MS = 30 * 1000;
 const HOLIDAY_COUNTDOWN_TICK_MS = 30 * 1000;
+const SCHEDULED_REMINDER_TICK_MS = 30 * 1000;
 const MULTI_MESSAGE_DELAY_MS = 1000;
+const CHENGFENG_TRIGGER_GROUP_ID = "866209871";
+const CHENGFENG_TRIGGER_KEYWORD = "乘风";
+const REPEAT_THRESHOLD = 5;
+const REPEAT_WINDOW_MS = 5 * 60 * 1000;
 
-const MSG_BUSY = "我还在处理上一条消息，请稍后再 @ 我";
 const MSG_AI_FAIL = "我刚刚思考超时了，请稍后再试一次";
 const MSG_VOICE_FAIL = "语音发送失败，我先用文字回复你";
+const MSG_CONVERSATION_NO_PERMISSION = "你没有清理其他人对话上下文的权限";
 const MSG_LIVE_CHAT_NO_PERMISSION = "你没有管理实时对话的权限";
 const MSG_INVALID_QQ = "请提供有效的 QQ 号";
 const MSG_DAILY_REPORT_NO_PERMISSION = "你没有管理群聊日报的权限";
-const MSG_DAILY_REPORT_BUSY = "当前群消息还在处理中，稍后再试日报命令";
 const MSG_HOLIDAY_COUNTDOWN_NO_PERMISSION = "你没有管理节假日倒计时的权限";
-const MSG_HOLIDAY_COUNTDOWN_BUSY = "当前群消息还在处理中，稍后再试节假日命令";
+const MSG_SCHEDULED_REMINDER_NO_PERMISSION = "你没有管理定时任务总开关的权限";
 const MSG_ADMIN_NO_PERMISSION = "你没有管理管理员的权限";
+const MSG_MUTE_NO_PERMISSION = "你没有让机器人闭嘴或说话的权限";
 
 export interface MessageTransport {
   sendGroupMessage(groupId: string, text: string): Promise<void>;
@@ -49,15 +66,25 @@ export interface MessageTransport {
   sendGroupAiRecord(groupId: string, text: string): Promise<void>;
   resolveImageInputs?(images: MessageImageInput[]): Promise<MessageImageInput[]>;
   resolveMentionTargets?(groupId: string, candidates: string[]): Promise<string[]>;
+  resolveMemberIdentities?(groupId: string, candidates: string[]): Promise<GroupMemberIdentity[]>;
+  getMessage?(messageId: string): Promise<ReferencedMessage | undefined>;
+}
+
+interface MessageInteractionContext {
+  interactionTargets: AiInteractionTarget[];
+  replyContext?: AiReplyContext;
 }
 
 export class BotApplication {
   private liveChatTimer?: NodeJS.Timeout;
   private dailyReportTimer?: NodeJS.Timeout;
   private holidayCountdownTimer?: NodeJS.Timeout;
+  private scheduledReminderTimer?: NodeJS.Timeout;
   private liveChatTickRunning = false;
   private dailyReportTickRunning = false;
   private holidayCountdownTickRunning = false;
+  private scheduledReminderTickRunning = false;
+  private readonly groupRepeatStates = new Map<string, { text: string; count: number; lastTimestamp: number }>();
 
   constructor(
     private readonly transport: MessageTransport,
@@ -68,6 +95,7 @@ export class BotApplication {
     private readonly ttsService: TtsService,
     private readonly dailyReportService: DailyReportService,
     private readonly holidayCountdownService: HolidayCountdownService,
+    private readonly scheduledReminderService: ScheduledReminderService,
     private readonly groupLock: GroupLock,
     private readonly liveChatService: LiveChatService,
     private readonly botQq: string,
@@ -75,7 +103,7 @@ export class BotApplication {
   ) {}
 
   start(): void {
-    if (this.liveChatTimer || this.dailyReportTimer || this.holidayCountdownTimer) {
+    if (this.liveChatTimer || this.dailyReportTimer || this.holidayCountdownTimer || this.scheduledReminderTimer) {
       return;
     }
 
@@ -93,6 +121,11 @@ export class BotApplication {
       void this.runHolidayCountdownTick();
     }, HOLIDAY_COUNTDOWN_TICK_MS);
     this.holidayCountdownTimer.unref();
+
+    this.scheduledReminderTimer = setInterval(() => {
+      void this.runScheduledReminderTick();
+    }, SCHEDULED_REMINDER_TICK_MS);
+    this.scheduledReminderTimer.unref();
   }
 
   stop(): void {
@@ -109,6 +142,11 @@ export class BotApplication {
     if (this.holidayCountdownTimer) {
       clearInterval(this.holidayCountdownTimer);
       this.holidayCountdownTimer = undefined;
+    }
+
+    if (this.scheduledReminderTimer) {
+      clearInterval(this.scheduledReminderTimer);
+      this.scheduledReminderTimer = undefined;
     }
   }
 
@@ -135,6 +173,50 @@ export class BotApplication {
 
     const commandText = extractCommandText(event.message);
 
+    if (commandText === MUTE_COMMAND || commandText === UNMUTE_COMMAND) {
+      await this.handleMuteCommand(groupConfig, event, commandText);
+      return;
+    }
+
+    if (commandText.toLowerCase() === CLEAR_GROUP_CONTEXT_COMMAND) {
+      await this.handleClearGroupContextCommand(groupConfig, event);
+      return;
+    }
+
+    if (groupConfig.botMuted === true) {
+      if (commandText.startsWith(DAILY_REPORT_PREFIX)) {
+        await this.handleDailyReportCommand(groupConfig, event, commandText);
+        return;
+      }
+
+      if (commandText.startsWith(HOLIDAY_COUNTDOWN_PREFIX)) {
+        await this.handleHolidayCountdownCommand(groupConfig, event, commandText);
+        return;
+      }
+
+      if (commandText.startsWith(SCHEDULED_REMINDER_PREFIX)) {
+        await this.handleScheduledReminderCommand(groupConfig, event, commandText);
+        return;
+      }
+
+      const parsedMessage = parseGroupMessage(event.message, this.botQq);
+      await this.recordDailyReportMessage(groupConfig, event, parsedMessage);
+      const chatSummaryRequest = parsedMessage.hasAtBot
+        ? parseChatSummaryRequest(parsedMessage.text, new Date())
+        : null;
+      if (chatSummaryRequest) {
+        await this.groupLock.run(groupId, async () => {
+          const summary = await this.dailyReportService.buildChatSummary({
+            groupId,
+            request: chatSummaryRequest,
+            now: new Date(),
+          });
+          await this.sendText(groupId, summary);
+        });
+      }
+      return;
+    }
+
     if (commandText.startsWith(LIVE_CHAT_PREFIX)) {
       await this.handleLiveChatCommand(groupConfig, event, commandText);
       return;
@@ -147,6 +229,11 @@ export class BotApplication {
 
     if (commandText.startsWith(ADMIN_PREFIX)) {
       await this.handleAdminCommand(groupConfig, event, commandText);
+      return;
+    }
+
+    if (commandText.startsWith(CONVERSATION_PREFIX)) {
+      await this.handleConversationCommand(groupConfig, event, commandText);
       return;
     }
 
@@ -165,7 +252,20 @@ export class BotApplication {
       return;
     }
 
+    if (commandText.startsWith(SCHEDULED_REMINDER_PREFIX)) {
+      await this.handleScheduledReminderCommand(groupConfig, event, commandText);
+      return;
+    }
+
+    const repeatText = extractRepeatableText(event.message, this.botQq);
+    if (repeatText && this.checkAndTriggerRepeat(groupId, repeatText)) {
+      logInfo("Triggered repeat message.", { groupId, userId, text: repeatText });
+      await this.sendText(groupId, repeatText);
+      return;
+    }
+
     const parsedMessage = parseGroupMessage(event.message, this.botQq);
+    const messageContext = await this.buildMessageInteractionContext(groupConfig, parsedMessage);
     const voiceCommand = parseVoiceCommand(commandText, parsedMessage.text, parsedMessage.hasAtBot);
 
     if (voiceCommand.matched) {
@@ -177,23 +277,17 @@ export class BotApplication {
         return;
       }
 
-      if (!this.groupLock.tryAcquire(groupId)) {
-        await this.sendText(groupId, MSG_BUSY);
-        return;
-      }
-
-      try {
+      await this.groupLock.run(groupId, async () => {
         await this.handleConversation(
           groupConfig,
           userId,
           voiceCommand.userInput ?? "",
           parsedMessage.images,
           "voice",
-          parsedMessage.mentionUserIds,
+          [],
+          messageContext,
         );
-      } finally {
-        this.groupLock.release(groupId);
-      }
+      });
       return;
     }
 
@@ -202,28 +296,53 @@ export class BotApplication {
       : null;
 
     if (chatSummaryRequest) {
-      if (!this.groupLock.tryAcquire(groupId)) {
-        await this.sendText(groupId, MSG_BUSY);
-        return;
-      }
-
-      try {
+      await this.groupLock.run(groupId, async () => {
         const summary = await this.dailyReportService.buildChatSummary({
           groupId,
           request: chatSummaryRequest,
           now: new Date(),
         });
         await this.sendText(groupId, summary);
-      } finally {
-        this.groupLock.release(groupId);
-      }
+      });
       return;
+    }
+
+    if (parsedMessage.hasAtBot) {
+      const reminderRequest = this.scheduledReminderService.parseCreateRequest(parsedMessage.text);
+      if (reminderRequest) {
+        const task = await this.scheduledReminderService.createTask({
+          groupId,
+          creatorUserId: userId,
+          request: reminderRequest,
+          now: new Date(),
+        });
+        await this.sendText(
+          groupId,
+          `已设置定时任务 ${task.id}：每 ${formatIntervalLabel(task.intervalMinutes)} 提醒群友${task.topic}`,
+        );
+        return;
+      }
     }
 
     await this.recordDailyReportMessage(groupConfig, event, parsedMessage);
 
+    if (this.shouldTriggerChengfeng(groupId, userId, parsedMessage.text, parsedMessage.hasAtBot, commandText)) {
+      await this.groupLock.run(groupId, async () => {
+        await this.handleConversation(
+          groupConfig,
+          userId,
+          parsedMessage.text,
+          parsedMessage.images,
+          "text",
+          [userId],
+          messageContext,
+        );
+      });
+      return;
+    }
+
     if (this.isLiveChatUser(groupConfig, userId) && !parsedMessage.hasAtBot && parsedMessage.text) {
-      this.liveChatService.addMessage(groupId, userId, parsedMessage.text);
+      this.liveChatService.addMessage(groupId, userId, parsedMessage.text, Date.now(), messageContext);
     }
 
     if (!parsedMessage.hasAtBot || (!parsedMessage.text && parsedMessage.images.length === 0)) {
@@ -237,23 +356,37 @@ export class BotApplication {
       return;
     }
 
-    if (!this.groupLock.tryAcquire(groupId)) {
-      await this.sendText(groupId, MSG_BUSY);
-      return;
-    }
-
-    try {
+    await this.groupLock.run(groupId, async () => {
       await this.handleConversation(
         groupConfig,
         userId,
         parsedMessage.text,
         parsedMessage.images,
         "text",
-        parsedMessage.mentionUserIds,
+        [],
+        messageContext,
+        true,
       );
-    } finally {
-      this.groupLock.release(groupId);
+    });
+  }
+
+  private shouldTriggerChengfeng(
+    groupId: string,
+    _userId: string,
+    text: string,
+    hasAtBot: boolean,
+    commandText: string,
+  ): boolean {
+    if (
+      groupId !== CHENGFENG_TRIGGER_GROUP_ID ||
+      hasAtBot ||
+      !text.includes(CHENGFENG_TRIGGER_KEYWORD) ||
+      commandText.trim().startsWith("#")
+    ) {
+      return false;
     }
+
+    return true;
   }
 
   private async runLiveChatTick(): Promise<void> {
@@ -317,21 +450,18 @@ export class BotApplication {
           continue;
         }
 
-        if (!this.groupLock.tryAcquire(groupId)) {
-          logInfo("Skipped live chat because group is busy.", { groupId });
-          consumeWindow();
-          continue;
-        }
-
         try {
-          await this.handleConversation(
-            groupConfig,
-            candidate.userId,
-            formatBufferedMessages(candidate.messages),
-            [],
-            "text",
-            [candidate.userId],
-          );
+          await this.groupLock.run(groupId, async () => {
+            await this.handleConversation(
+              groupConfig,
+              candidate.userId,
+              formatBufferedMessages(candidate.messages),
+              [],
+              "text",
+              [candidate.userId],
+              buildBufferedInteractionContext(candidate.messages),
+            );
+          });
           logInfo("Sent live chat reply.", {
             groupId,
             userId: candidate.userId,
@@ -345,7 +475,6 @@ export class BotApplication {
             error: (error as Error).message,
           });
         } finally {
-          this.groupLock.release(groupId);
           consumeWindow();
         }
       }
@@ -373,17 +502,12 @@ export class BotApplication {
           continue;
         }
 
-        if (!this.groupLock.tryAcquire(groupConfig.groupId)) {
-          logInfo("Skipped daily report because group is busy.", {
-            groupId: groupConfig.groupId,
-          });
-          continue;
-        }
-
         try {
-          const report = await this.dailyReportService.buildReport(groupConfig, now);
-          await this.sendText(groupConfig.groupId, report);
-          await this.dailyReportService.markSent(groupConfig.groupId, now);
+          await this.groupLock.run(groupConfig.groupId, async () => {
+            const report = await this.dailyReportService.buildReport(groupConfig, now);
+            await this.sendText(groupConfig.groupId, report);
+            await this.dailyReportService.markSent(groupConfig.groupId, now);
+          });
           logInfo("Sent daily group report.", {
             groupId: groupConfig.groupId,
             time: formatClockTime(now),
@@ -393,8 +517,6 @@ export class BotApplication {
             groupId: groupConfig.groupId,
             error: (error as Error).message,
           });
-        } finally {
-          this.groupLock.release(groupConfig.groupId);
         }
       }
     } catch (error) {
@@ -421,17 +543,12 @@ export class BotApplication {
           continue;
         }
 
-        if (!this.groupLock.tryAcquire(groupConfig.groupId)) {
-          logInfo("Skipped holiday countdown because group is busy.", {
-            groupId: groupConfig.groupId,
-          });
-          continue;
-        }
-
         try {
-          const message = await this.holidayCountdownService.buildCountdownMessage(now);
-          await this.sendText(groupConfig.groupId, message);
-          await this.holidayCountdownService.markSent(groupConfig.groupId, now);
+          await this.groupLock.run(groupConfig.groupId, async () => {
+            const message = await this.holidayCountdownService.buildCountdownMessage(now);
+            await this.sendText(groupConfig.groupId, message);
+            await this.holidayCountdownService.markSent(groupConfig.groupId, now);
+          });
           logInfo("Sent holiday countdown.", {
             groupId: groupConfig.groupId,
             time: formatClockTime(now),
@@ -441,8 +558,6 @@ export class BotApplication {
             groupId: groupConfig.groupId,
             error: (error as Error).message,
           });
-        } finally {
-          this.groupLock.release(groupConfig.groupId);
         }
       }
     } catch (error) {
@@ -451,6 +566,55 @@ export class BotApplication {
       });
     } finally {
       this.holidayCountdownTickRunning = false;
+    }
+  }
+
+  private async runScheduledReminderTick(now = new Date()): Promise<void> {
+    if (this.scheduledReminderTickRunning) {
+      return;
+    }
+
+    if (!isWithinWorkHours(now)) {
+      return;
+    }
+
+    this.scheduledReminderTickRunning = true;
+
+    try {
+      const groups = await this.groupConfigService.getAll();
+      const groupsById = new Map(groups.map((group) => [group.groupId, group]));
+      const dueTasks = await this.scheduledReminderService.getDueTasks(now);
+      for (const task of dueTasks) {
+        const groupConfig = groupsById.get(task.groupId);
+        if (!groupConfig || groupConfig.scheduledRemindersEnabled === false) {
+          continue;
+        }
+
+        try {
+          await this.groupLock.run(task.groupId, async () => {
+            const message = await this.scheduledReminderService.buildReminderMessage(task);
+            await this.sendText(task.groupId, message);
+            await this.scheduledReminderService.markSent(task.id, message, now);
+          });
+          logInfo("Sent scheduled reminder.", {
+            groupId: task.groupId,
+            taskId: task.id,
+            intervalMinutes: task.intervalMinutes,
+          });
+        } catch (error) {
+          logError("Scheduled reminder tick failed.", {
+            groupId: task.groupId,
+            taskId: task.id,
+            error: (error as Error).message,
+          });
+        }
+      }
+    } catch (error) {
+      logError("Scheduled reminder scheduler failed.", {
+        error: (error as Error).message,
+      });
+    } finally {
+      this.scheduledReminderTickRunning = false;
     }
   }
 
@@ -566,6 +730,29 @@ export class BotApplication {
     );
   }
 
+  private async handleMuteCommand(
+    groupConfig: GroupBotConfig,
+    event: NapcatGroupMessageEvent,
+    commandText: string,
+  ): Promise<void> {
+    const groupId = groupConfig.groupId;
+    const userId = String(event.user_id);
+
+    if (!(await this.isAdmin(groupConfig, userId))) {
+      await this.sendText(groupId, MSG_MUTE_NO_PERMISSION);
+      return;
+    }
+
+    if (commandText === MUTE_COMMAND) {
+      await this.groupConfigService.updateBotMuted(groupId, true);
+      await this.sendText(groupId, "机器人已闭嘴，只保留总结、日报、节假日和定时任务能力");
+      return;
+    }
+
+    await this.groupConfigService.updateBotMuted(groupId, false);
+    await this.sendText(groupId, "机器人已恢复说话");
+  }
+
   private async handleDailyReportCommand(
     groupConfig: GroupBotConfig,
     event: NapcatGroupMessageEvent,
@@ -596,17 +783,10 @@ export class BotApplication {
         return;
       }
 
-      if (!this.groupLock.tryAcquire(groupId)) {
-        await this.sendText(groupId, MSG_DAILY_REPORT_BUSY);
-        return;
-      }
-
-      try {
+      await this.groupLock.run(groupId, async () => {
         const report = await this.dailyReportService.buildReport(groupConfig, new Date());
         await this.sendText(groupId, report);
-      } finally {
-        this.groupLock.release(groupId);
-      }
+      });
       return;
     }
 
@@ -679,17 +859,10 @@ export class BotApplication {
         return;
       }
 
-      if (!this.groupLock.tryAcquire(groupId)) {
-        await this.sendText(groupId, MSG_HOLIDAY_COUNTDOWN_BUSY);
-        return;
-      }
-
-      try {
+      await this.groupLock.run(groupId, async () => {
         const message = await this.holidayCountdownService.buildCountdownMessage(new Date());
         await this.sendText(groupId, message);
-      } finally {
-        this.groupLock.release(groupId);
-      }
+      });
       return;
     }
 
@@ -732,6 +905,149 @@ export class BotApplication {
         `${HOLIDAY_COUNTDOWN_PREFIX} 开启`,
         `${HOLIDAY_COUNTDOWN_PREFIX} 关闭`,
         `${HOLIDAY_COUNTDOWN_PREFIX} 时间 <HH:mm>`,
+      ].join("\n"),
+    );
+  }
+
+  private async handleScheduledReminderCommand(
+    groupConfig: GroupBotConfig,
+    event: NapcatGroupMessageEvent,
+    commandText: string,
+  ): Promise<void> {
+    const groupId = groupConfig.groupId;
+    const userId = String(event.user_id);
+    const normalized = commandText.replace(/\s+/g, " ").trim();
+
+    if (
+      normalized === `${SCHEDULED_REMINDER_PREFIX} 状态` ||
+      normalized === `${SCHEDULED_REMINDER_PREFIX} 开启` ||
+      normalized === `${SCHEDULED_REMINDER_PREFIX} 关闭`
+    ) {
+      if (normalized === `${SCHEDULED_REMINDER_PREFIX} 状态`) {
+        await this.sendText(
+          groupId,
+          `定时任务总开关：${groupConfig.scheduledRemindersEnabled === false ? "已关闭" : "已开启"}`,
+        );
+        return;
+      }
+
+      if (!(await this.isAdmin(groupConfig, userId))) {
+        await this.sendText(groupId, MSG_SCHEDULED_REMINDER_NO_PERMISSION);
+        return;
+      }
+
+      const enabled = normalized === `${SCHEDULED_REMINDER_PREFIX} 开启`;
+      await this.groupConfigService.updateScheduledRemindersEnabled(groupId, enabled);
+      await this.sendText(groupId, enabled ? "已开启当前群定时任务" : "已关闭当前群定时任务，已有任务不会删除");
+      return;
+    }
+
+    if (
+      normalized === SCHEDULED_REMINDER_PREFIX ||
+      normalized === `${SCHEDULED_REMINDER_PREFIX} 列表` ||
+      normalized === `${SCHEDULED_REMINDER_PREFIX} 查看`
+    ) {
+      const tasks = await this.scheduledReminderService.listGroupTasks(groupId);
+      const statusLine = `定时任务总开关：${groupConfig.scheduledRemindersEnabled === false ? "已关闭" : "已开启"}`;
+      if (tasks.length === 0) {
+        await this.sendText(groupId, `${statusLine}\n当前群还没有定时任务`);
+        return;
+      }
+
+      await this.sendText(
+        groupId,
+        [
+          statusLine,
+          "当前群定时任务：",
+          ...tasks.map((task) =>
+            `${task.id}：每 ${formatIntervalLabel(task.intervalMinutes)} 提醒群友${task.topic}，下次 ${formatLocalDateTime(new Date(task.nextRunAt))}`,
+          ),
+        ].join("\n"),
+      );
+      return;
+    }
+
+    const deleteMatch = normalized.match(new RegExp(`^${escapeRegex(SCHEDULED_REMINDER_PREFIX)}\\s*(?:删除|移除|取消)\\s+(.+)$`));
+    if (deleteMatch) {
+      const taskId = deleteMatch[1]?.trim();
+      if (!taskId) {
+        await this.sendText(groupId, "请提供要删除的定时任务 ID");
+        return;
+      }
+
+      const removed = await this.scheduledReminderService.removeGroupTask(groupId, taskId);
+      await this.sendText(groupId, removed ? `已删除定时任务 ${taskId}` : `没找到定时任务 ${taskId}`);
+      return;
+    }
+
+    const modifyMatch = normalized.match(new RegExp(`^${escapeRegex(SCHEDULED_REMINDER_PREFIX)}\\s*修改\\s+(.+)$`));
+    if (modifyMatch) {
+      const modifyRequest = this.scheduledReminderService.parseModifyRequest(modifyMatch[1]!);
+      if (!modifyRequest) {
+        await this.sendText(
+          groupId,
+          [
+            "定时任务修改格式：",
+            `${SCHEDULED_REMINDER_PREFIX} 修改 <任务ID> 每30分钟提醒群友喝水`,
+          ].join("\n"),
+        );
+        return;
+      }
+
+      const existing = (await this.scheduledReminderService.listGroupTasks(groupId)).find(
+        (task) => task.id === modifyRequest.taskId,
+      );
+      if (!existing) {
+        await this.sendText(groupId, `没找到定时任务 ${modifyRequest.taskId}`);
+        return;
+      }
+
+      const updated = await this.scheduledReminderService.updateTask(modifyRequest.taskId, {
+        intervalMinutes: modifyRequest.request.intervalMinutes,
+        topic: modifyRequest.request.topic,
+      });
+      if (!updated) {
+        await this.sendText(groupId, `修改定时任务 ${modifyRequest.taskId} 失败`);
+        return;
+      }
+
+      await this.sendText(
+        groupId,
+        `已修改定时任务 ${updated.id}：每 ${formatIntervalLabel(updated.intervalMinutes)} 提醒群友${updated.topic}`,
+      );
+      return;
+    }
+
+    const normalizedCreateText = normalized.replace(
+      new RegExp(`^${escapeRegex(SCHEDULED_REMINDER_PREFIX)}\\s*(?:添加|设置|创建|新建)?\\s*`),
+      "设置定时任务",
+    );
+    const request = this.scheduledReminderService.parseCreateRequest(normalizedCreateText);
+    if (request) {
+      const task = await this.scheduledReminderService.createTask({
+        groupId,
+        creatorUserId: userId,
+        request,
+        now: new Date(),
+      });
+      await this.sendText(
+        groupId,
+        `已设置定时任务 ${task.id}：每 ${formatIntervalLabel(task.intervalMinutes)} 提醒群友${task.topic}`,
+      );
+      return;
+    }
+
+    await this.sendText(
+      groupId,
+      [
+        "定时任务命令格式：",
+        `${SCHEDULED_REMINDER_PREFIX} 列表`,
+        `${SCHEDULED_REMINDER_PREFIX} 添加 每小时提醒群友喝水`,
+        `${SCHEDULED_REMINDER_PREFIX} 修改 <任务ID> 每30分钟提醒群友喝水`,
+        `${SCHEDULED_REMINDER_PREFIX} 删除 <任务ID>`,
+        `${SCHEDULED_REMINDER_PREFIX} 状态 / 开启 / 关闭`,
+        "也可以直接 @机器人 设置定时任务一个小时提醒群友喝水",
+        "注意：定时任务仅在工作日 9:00-18:00 范围内触发",
       ].join("\n"),
     );
   }
@@ -830,20 +1146,95 @@ export class BotApplication {
     );
   }
 
+  private async handleConversationCommand(
+    groupConfig: GroupBotConfig,
+    event: NapcatGroupMessageEvent,
+    commandText: string,
+  ): Promise<void> {
+    const groupId = groupConfig.groupId;
+    const userId = String(event.user_id);
+    const normalized = commandText.replace(/\s+/g, " ").trim();
+    const clearRegex = new RegExp(`^${escapeRegex(CONVERSATION_PREFIX)}\\s*清空(?:\\s+(.+))?$`);
+    const match = normalized.match(clearRegex);
+    const mentionedUserId = extractFirstAtUserId(event.message, this.botQq);
+
+    if (!match) {
+      await this.sendText(
+        groupId,
+        [
+          "对话命令格式：",
+          `${CONVERSATION_PREFIX} 清空`,
+          `${CONVERSATION_PREFIX} 清空 <QQ号>`,
+          `${CONVERSATION_PREFIX} 清空 全部`,
+        ].join("\n"),
+      );
+      return;
+    }
+
+    const targetInput = match[1]?.trim() || mentionedUserId;
+    if (!targetInput) {
+      await this.conversationStore.clearUser(groupId, userId);
+      await this.sendText(groupId, "已清空你在当前群的对话上下文");
+      return;
+    }
+
+    if (!(await this.isAdmin(groupConfig, userId))) {
+      await this.sendText(groupId, MSG_CONVERSATION_NO_PERMISSION);
+      return;
+    }
+
+    if (targetInput === "全部" || targetInput.toLowerCase() === "all") {
+      await this.conversationStore.clearGroup(groupId);
+      await this.sendText(groupId, "已清空当前群全部成员的对话上下文");
+      return;
+    }
+
+    const targetQq = extractQqFromInput(targetInput);
+    if (!targetQq) {
+      await this.sendText(groupId, MSG_INVALID_QQ);
+      return;
+    }
+
+    await this.conversationStore.clearUser(groupId, targetQq);
+    await this.sendText(groupId, `已清空 ${targetQq} 在当前群的对话上下文`);
+  }
+
+  private async handleClearGroupContextCommand(
+    groupConfig: GroupBotConfig,
+    event: NapcatGroupMessageEvent,
+  ): Promise<void> {
+    const groupId = groupConfig.groupId;
+    const userId = String(event.user_id);
+
+    if (!(await this.isAdmin(groupConfig, userId))) {
+      await this.sendText(groupId, MSG_CONVERSATION_NO_PERMISSION);
+      return;
+    }
+
+    await this.conversationStore.clearGroup(groupId);
+    await this.sendText(groupId, "已清空当前群全部成员的对话上下文");
+  }
+
   private async handleConversation(
     groupConfig: GroupBotConfig,
     userId: string,
     userInput: string,
     images: MessageImageInput[],
     replyMode: "text" | "voice" = "text",
-    mentionUserIds: string[] = [],
+    prefixMentionUserIds: string[] = [],
+    messageContext: MessageInteractionContext = { interactionTargets: [] },
+    allowControlledMention = false,
   ): Promise<void> {
     const skill = await this.resolveSkill(groupConfig);
-    const history = await this.conversationStore.getTurns(groupConfig.groupId);
+    const history = await this.conversationStore.getTurns(groupConfig.groupId, userId);
     const normalizedUserInput = userInput.trim() || "[图片消息]";
+    const allImages = [
+      ...images,
+      ...(messageContext.replyContext?.images ?? []),
+    ];
     const resolvedImages = this.transport.resolveImageInputs
-      ? await this.transport.resolveImageInputs(images)
-      : images.filter((image) => Boolean(image.url));
+      ? await this.transport.resolveImageInputs(allImages)
+      : allImages.filter((image) => Boolean(image.url));
 
     try {
       const reply = await this.aiService.generateReply({
@@ -851,12 +1242,45 @@ export class BotApplication {
         history,
         userInput: normalizedUserInput,
         images: resolvedImages,
+        identityContext: {
+          groupId: groupConfig.groupId,
+          currentUserId: userId,
+          botUserId: this.botQq,
+          manualIdentities: groupConfig.manualIdentities,
+          ...(messageContext.interactionTargets.length > 0
+            ? { interactionTargets: messageContext.interactionTargets }
+            : {}),
+          ...(messageContext.replyContext ? { replyContext: messageContext.replyContext } : {}),
+        },
       });
       const resolvedMentionUserIds = await this.resolveMentionUserIds(
         groupConfig.groupId,
-        mentionUserIds,
+        prefixMentionUserIds,
       );
-      const replyText = sanitizeMentionEcho(reply.text, resolvedMentionUserIds);
+      const replyText = sanitizeMentionEcho(reply.text, buildSanitizeTargets(messageContext));
+      const controlledMentionUserId =
+        allowControlledMention && resolvedMentionUserIds.length === 0 && replyMode === "text"
+          ? await this.resolveControlledMentionUserId({
+              groupConfig,
+              skill,
+              history,
+              userInput: normalizedUserInput,
+              assistantReply: replyText,
+              identityContext: {
+                groupId: groupConfig.groupId,
+                currentUserId: userId,
+                botUserId: this.botQq,
+                manualIdentities: groupConfig.manualIdentities,
+                ...(messageContext.interactionTargets.length > 0
+                  ? { interactionTargets: messageContext.interactionTargets }
+                  : {}),
+                ...(messageContext.replyContext ? { replyContext: messageContext.replyContext } : {}),
+              },
+            })
+          : undefined;
+      const outgoingMentionUserIds = controlledMentionUserId
+        ? [controlledMentionUserId]
+        : resolvedMentionUserIds;
 
       const now = new Date().toISOString();
       const turns: ConversationTurn[] = [
@@ -880,6 +1304,7 @@ export class BotApplication {
 
       await this.conversationStore.appendDialogue(
         groupConfig.groupId,
+        userId,
         turns,
         skill.maxContextTurns * 2,
       );
@@ -899,7 +1324,7 @@ export class BotApplication {
         throw new Error("Formatted AI reply was empty.");
       }
 
-      await this.sendTextMessages(groupConfig.groupId, outgoingMessages, resolvedMentionUserIds);
+      await this.sendTextMessages(groupConfig.groupId, outgoingMessages, outgoingMentionUserIds);
 
       logInfo("Sent AI reply.", {
         groupId: groupConfig.groupId,
@@ -914,6 +1339,41 @@ export class BotApplication {
       });
       await this.sendText(groupConfig.groupId, MSG_AI_FAIL);
     }
+  }
+
+  private async resolveControlledMentionUserId(args: {
+    groupConfig: GroupBotConfig;
+    skill: SkillDefinition;
+    history: ConversationTurn[];
+    userInput: string;
+    assistantReply: string;
+    identityContext: {
+      groupId: string;
+      currentUserId: string;
+      botUserId?: string;
+      manualIdentities?: GroupBotConfig["manualIdentities"];
+      interactionTargets?: AiInteractionTarget[];
+      replyContext?: AiReplyContext;
+    };
+  }): Promise<string | undefined> {
+    if (!args.groupConfig.manualIdentities || args.groupConfig.manualIdentities.length === 0) {
+      return undefined;
+    }
+
+    const decision = await this.aiService.evaluateControlledMention?.({
+      skill: args.skill,
+      history: args.history,
+      userInput: args.userInput,
+      assistantReply: args.assistantReply,
+      identityContext: args.identityContext,
+    });
+
+    const target = resolveManualIdentityTargetFromDecision(args.groupConfig, decision);
+    if (!target?.userId) {
+      return undefined;
+    }
+
+    return target.userId;
   }
 
   private async handleVoiceReply(
@@ -1037,6 +1497,22 @@ export class BotApplication {
     return groupConfig.liveChatUserIds.includes(userId);
   }
 
+  private checkAndTriggerRepeat(groupId: string, text: string): boolean {
+    const now = Date.now();
+    const state = this.groupRepeatStates.get(groupId);
+    const nextCount = state && state.text === text && now - state.lastTimestamp <= REPEAT_WINDOW_MS
+      ? state.count + 1
+      : 1;
+
+    this.groupRepeatStates.set(groupId, {
+      text,
+      count: nextCount,
+      lastTimestamp: now,
+    });
+
+    return nextCount === REPEAT_THRESHOLD;
+  }
+
   private async isAdmin(groupConfig: GroupBotConfig, userId: string): Promise<boolean> {
     if (groupConfig.switcherUserIds.includes(userId)) {
       return true;
@@ -1094,14 +1570,141 @@ export class BotApplication {
     }
 
     try {
-      return await this.transport.resolveMentionTargets(groupId, uniqueCandidates);
+      const resolved = await this.transport.resolveMentionTargets(groupId, uniqueCandidates);
+      const numericCandidates = uniqueCandidates.filter((candidate) => /^\d+$/.test(candidate));
+      return [...new Set([...resolved, ...numericCandidates])];
     } catch (error) {
       logWarn("Failed to resolve mention targets. Falling back to plain reply.", {
         groupId,
         error: (error as Error).message,
         candidateCount: uniqueCandidates.length,
       });
+      return uniqueCandidates.filter((candidate) => /^\d+$/.test(candidate));
+    }
+  }
+
+  private async buildMessageInteractionContext(
+    groupConfig: GroupBotConfig,
+    parsedMessage: ReturnType<typeof parseGroupMessage>,
+  ): Promise<MessageInteractionContext> {
+    const interactionTargets = await this.resolveInteractionTargets(
+      groupConfig,
+      parsedMessage.mentionUserIds,
+      "mention",
+    );
+    const replyContext = await this.resolveReplyContext(groupConfig, parsedMessage.replyMessageId);
+
+    if (replyContext) {
+      interactionTargets.push(
+        ...buildInteractionTargetsFromReply(groupConfig, replyContext),
+      );
+    }
+
+    return {
+      interactionTargets: dedupeInteractionTargets(interactionTargets),
+      replyContext,
+    };
+  }
+
+  private async resolveInteractionTargets(
+    groupConfig: GroupBotConfig,
+    candidates: string[],
+    source: AiInteractionTarget["source"],
+  ): Promise<AiInteractionTarget[]> {
+    const uniqueCandidates = [...new Set(candidates.map((candidate) => candidate.trim()).filter(Boolean))];
+    if (uniqueCandidates.length === 0) {
       return [];
+    }
+
+    const byCandidate = new Map<string, AiInteractionTarget>();
+    const unresolved: string[] = [];
+    for (const candidate of uniqueCandidates) {
+      const manualTarget = resolveManualIdentityTarget(groupConfig, candidate, source);
+      if (manualTarget) {
+        byCandidate.set(candidate, manualTarget);
+      } else {
+        unresolved.push(candidate);
+      }
+    }
+
+    if (unresolved.length > 0 && this.transport.resolveMemberIdentities) {
+      try {
+        const memberIdentities = await this.transport.resolveMemberIdentities(groupConfig.groupId, unresolved);
+        for (const identity of memberIdentities) {
+          const matchedCandidate = unresolved.find((candidate) =>
+            !byCandidate.has(candidate) && identityMatchesCandidate(identity, candidate),
+          );
+          if (!matchedCandidate) {
+            continue;
+          }
+
+          const manualTarget = resolveManualIdentityTarget(groupConfig, identity.userId, source);
+          byCandidate.set(matchedCandidate, manualTarget ?? {
+            userId: identity.userId,
+            names: normalizeNames(identity.names),
+            source,
+          });
+        }
+      } catch (error) {
+        logWarn("Failed to resolve interaction target names. Falling back to raw candidates.", {
+          groupId: groupConfig.groupId,
+          error: (error as Error).message,
+          candidateCount: unresolved.length,
+        });
+      }
+    }
+
+    for (const candidate of unresolved) {
+      if (byCandidate.has(candidate)) {
+        continue;
+      }
+
+      const strippedCandidate = stripMentionPrefix(candidate);
+      byCandidate.set(
+        candidate,
+        /^\d+$/.test(strippedCandidate)
+          ? { userId: strippedCandidate, names: [strippedCandidate], source }
+          : { names: [strippedCandidate], source },
+      );
+    }
+
+    return [...byCandidate.values()];
+  }
+
+  private async resolveReplyContext(
+    groupConfig: GroupBotConfig,
+    replyMessageId?: string,
+  ): Promise<AiReplyContext | undefined> {
+    if (!replyMessageId || !this.transport.getMessage) {
+      return undefined;
+    }
+
+    try {
+      const referenced = await this.transport.getMessage(replyMessageId);
+      if (!referenced) {
+        return undefined;
+      }
+
+      const manualTarget = referenced.userId
+        ? resolveManualIdentityTarget(groupConfig, referenced.userId, "reply")
+        : undefined;
+      const primaryName =
+        manualTarget?.names[0] ?? referenced.userName ?? referenced.userId;
+
+      return {
+        messageId: referenced.messageId,
+        userId: referenced.userId,
+        userName: primaryName,
+        text: buildReferencedMessageText(referenced),
+        images: referenced.images,
+      };
+    } catch (error) {
+      logWarn("Failed to load referenced message context.", {
+        groupId: groupConfig.groupId,
+        replyMessageId,
+        error: (error as Error).message,
+      });
+      return undefined;
     }
   }
 
@@ -1135,6 +1738,19 @@ function extractCommandText(message: NapcatGroupMessageEvent["message"]): string
     .trim();
 }
 
+function extractRepeatableText(message: NapcatGroupMessageEvent["message"], botQq: string): string | undefined {
+  const parsedMessage = parseGroupMessage(message, botQq);
+  if (parsedMessage.hasAtBot) {
+    return undefined;
+  }
+
+  const text = extractCommandText(message);
+  if (!text || text.startsWith("#")) {
+    return undefined;
+  }
+  return text;
+}
+
 function escapeRegex(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
@@ -1148,12 +1764,53 @@ function extractQqFromInput(input: string): string {
   return input.trim().replace(/\D/g, "");
 }
 
-function formatBufferedMessages(messages: BufferedMessage[]): string {
-  if (messages.length === 1) {
-    return messages[0]!.text;
+function extractFirstAtUserId(message: NapcatGroupMessageEvent["message"], botQq: string): string | undefined {
+  if (typeof message === "string") {
+    const match = message.match(/\[CQ:at,qq=(\d+)(?:,[^\]]*)?\]/i);
+    const userId = match?.[1];
+    return userId && userId !== botQq ? userId : undefined;
   }
 
-  return messages.map((message, index) => `${index + 1}. ${message.text}`).join("\n");
+  for (const segment of message) {
+    if (typeof segment === "string") {
+      continue;
+    }
+
+    if (segment.type !== "at") {
+      continue;
+    }
+
+    const userId = String(segment.data?.qq ?? "").trim();
+    if (userId && userId !== botQq) {
+      return userId;
+    }
+  }
+
+  return undefined;
+}
+
+function buildBufferedInteractionContext(messages: BufferedMessage[]): MessageInteractionContext {
+  const interactionTargets = messages.flatMap((message) => message.interactionTargets ?? []);
+  const replyContext = [...messages].reverse().find((message) => message.replyContext)?.replyContext;
+
+  return {
+    interactionTargets: dedupeInteractionTargets(interactionTargets),
+    replyContext,
+  };
+}
+
+function formatBufferedMessages(messages: BufferedMessage[]): string {
+  if (messages.length === 1) {
+    return formatBufferedMessage(messages[0]!);
+  }
+
+  return messages
+    .map((message, index) => `${index + 1}. ${formatBufferedMessage(message)}`)
+    .join("\n");
+}
+
+function formatBufferedMessage(message: BufferedMessage): string {
+  return message.text;
 }
 
 function prefixAtMentions(userIds: string[], message: string): string {
@@ -1162,20 +1819,178 @@ function prefixAtMentions(userIds: string[], message: string): string {
   return normalized ? `${prefix} ${normalized}` : prefix;
 }
 
-function sanitizeMentionEcho(text: string, mentionUserIds: string[]): string {
+function sanitizeMentionEcho(text: string, targets: AiInteractionTarget[]): string {
   let sanitized = text;
 
-  for (const userId of mentionUserIds) {
-    const escapedUserId = escapeRegex(userId);
-    sanitized = sanitized
-      .replace(new RegExp(`@${escapedUserId}(?!\\d)`, "g"), " ")
-      .replace(new RegExp(`(?<!\\d)${escapedUserId}(?!\\d)`, "g"), " ");
+  for (const target of targets) {
+    const replacement = getTargetDisplayName(target);
+    if (target.userId) {
+      const escapedUserId = escapeRegex(target.userId);
+      sanitized = sanitized
+        .replace(new RegExp(`\\[CQ:at,qq=${escapedUserId}(?:,[^\\]]*)?\\]`, "gi"), replacement)
+        .replace(new RegExp(`@${escapedUserId}(?!\\d)`, "g"), replacement);
+    }
+
+    for (const name of target.names) {
+      const normalizedName = stripMentionPrefix(name);
+      if (!normalizedName || /^\d+$/.test(normalizedName)) {
+        continue;
+      }
+
+      const escapedName = escapeRegex(normalizedName);
+      sanitized = sanitized.replace(new RegExp(`@${escapedName}`, "g"), normalizedName);
+    }
   }
 
   return sanitized
     .replace(/\s+/g, " ")
     .replace(/[ \t]+([，。！？；,.!?;:])/g, "$1")
     .trim();
+}
+
+function buildSanitizeTargets(context: MessageInteractionContext): AiInteractionTarget[] {
+  return dedupeInteractionTargets(context.interactionTargets);
+}
+
+function buildInteractionTargetsFromReply(
+  groupConfig: GroupBotConfig,
+  replyContext: AiReplyContext,
+): AiInteractionTarget[] {
+  if (replyContext.userId) {
+    const manualTarget = resolveManualIdentityTarget(groupConfig, replyContext.userId, "reply");
+    return [
+      manualTarget ?? {
+        userId: replyContext.userId,
+        names: normalizeNames([replyContext.userName, replyContext.userId]),
+        source: "reply",
+      },
+    ];
+  }
+
+  if (replyContext.userName) {
+    return [{ names: [replyContext.userName], source: "reply" }];
+  }
+
+  return [];
+}
+
+function resolveManualIdentityTarget(
+  groupConfig: GroupBotConfig,
+  candidate: string,
+  source: AiInteractionTarget["source"],
+): AiInteractionTarget | undefined {
+  const normalizedCandidate = normalizeIdentityCandidate(candidate);
+  if (!normalizedCandidate) {
+    return undefined;
+  }
+
+  const identity = groupConfig.manualIdentities?.find((item) => {
+    const ids = item.userIds.map(normalizeIdentityCandidate);
+    const names = item.names.map(normalizeIdentityCandidate);
+    return ids.includes(normalizedCandidate) || names.includes(normalizedCandidate);
+  });
+
+  if (!identity) {
+    return undefined;
+  }
+
+  return {
+    userId: identity.userIds[0],
+    names: normalizeNames(identity.names),
+    source,
+  };
+}
+
+function resolveManualIdentityTargetFromDecision(
+  groupConfig: GroupBotConfig,
+  decision?: ControlledMentionDecision,
+): AiInteractionTarget | undefined {
+  const target = decision?.target?.trim();
+  if (!decision?.shouldMention || !target) {
+    return undefined;
+  }
+
+  const matches =
+    groupConfig.manualIdentities?.filter((identity) => {
+      const candidates = [...identity.userIds, ...identity.names].map(normalizeIdentityCandidate);
+      return candidates.includes(normalizeIdentityCandidate(target));
+    }) ?? [];
+
+  if (matches.length !== 1) {
+    return undefined;
+  }
+
+  const identity = matches[0]!;
+  return {
+    userId: identity.userIds[0],
+    names: normalizeNames(identity.names),
+    source: "mention",
+  };
+}
+
+function identityMatchesCandidate(identity: GroupMemberIdentity, candidate: string): boolean {
+  const normalizedCandidate = normalizeIdentityCandidate(candidate);
+  if (!normalizedCandidate) {
+    return false;
+  }
+
+  return (
+    normalizeIdentityCandidate(identity.userId) === normalizedCandidate ||
+    identity.names.some((name) => normalizeIdentityCandidate(name) === normalizedCandidate)
+  );
+}
+
+function dedupeInteractionTargets(targets: AiInteractionTarget[]): AiInteractionTarget[] {
+  const byKey = new Map<string, AiInteractionTarget>();
+
+  for (const target of targets) {
+    const names = normalizeNames(target.names);
+    const key = target.userId ? `${target.source}:${target.userId}` : `${target.source}:${names[0] ?? ""}`;
+    if (!key.endsWith(":")) {
+      byKey.set(key, {
+        ...target,
+        names,
+      });
+    }
+  }
+
+  return [...byKey.values()];
+}
+
+function normalizeNames(names: Array<string | undefined>): string[] {
+  return [...new Set(names.map((name) => name?.trim()).filter((name): name is string => Boolean(name)))];
+}
+
+function stripMentionPrefix(value: string): string {
+  return value.replace(/^@+/, "").trim();
+}
+
+function normalizeIdentityCandidate(value: string): string {
+  return stripMentionPrefix(value)
+    .toLowerCase()
+    .replace(/^[\s,:;锛屻€傦紒锛熴€併€愩€慭[\]()锛堬級<>銆娿€?'`]+|[\s,:;锛屻€傦紒锛熴€併€愩€慭[\]()锛堬級<>銆娿€?'`]+$/g, "")
+    .replace(/\s+/g, "");
+}
+
+function getTargetDisplayName(target: AiInteractionTarget): string {
+  return normalizeNames(target.names)[0] ?? target.userId ?? "";
+}
+
+function buildReferencedMessageText(message: ReferencedMessage): string {
+  const text = message.text.trim();
+  if (text && message.images.length > 0) {
+    return `${text} [图片 ${message.images.length} 张]`;
+  }
+
+  if (text) {
+    return text;
+  }
+
+  if (message.images.length > 0) {
+    return message.images.length > 1 ? `[图片消息 ${message.images.length} 张]` : "[图片消息]";
+  }
+
+  return "";
 }
 
 function buildDailyReportMessageText(
@@ -1216,6 +2031,16 @@ function formatClockTime(date: Date): string {
   return `${`${date.getHours()}`.padStart(2, "0")}:${`${date.getMinutes()}`.padStart(2, "0")}`;
 }
 
+function formatLocalDateTime(date: Date): string {
+  return [
+    `${date.getMonth() + 1}`.padStart(2, "0"),
+    "-",
+    `${date.getDate()}`.padStart(2, "0"),
+    " ",
+    formatClockTime(date),
+  ].join("");
+}
+
 function buildFeatureListMessage(commandText = ""): string {
   const topic = parseHelpTopic(commandText);
   const sections = buildHelpSections();
@@ -1229,7 +2054,7 @@ function buildFeatureListMessage(commandText = ""): string {
     return [
       `没找到“${topic}”这个帮助分类`,
       "",
-      "可用分类：对话、语音、技能、实时对话、日报、节假日、管理员、权限",
+      "可用分类：对话、语音、技能、实时对话、定时任务、日报、节假日、管理员、权限",
       "示例：#功能 技能",
       "",
       buildHelpOverviewMessage(sections),
@@ -1276,8 +2101,11 @@ function buildHelpSections(): HelpSection[] {
       aliases: ["对话", "聊天", "chat"],
       lines: [
         "1. @机器人 <内容>",
-        "作用：使用当前 skill 进行文本对话",
-        "说明：普通群消息不会触发，必须 @机器人",
+        "2. #对话 清空",
+        "3. #对话 清空 <QQ号> / 全部",
+        "4. #clear",
+        "作用：使用当前 skill 进行文本对话，或清空当前群上下文",
+        "说明：普通群消息不会触发，必须 @机器人；#clear 需要群管理员或超级管理员",
       ],
     },
     {
@@ -1306,6 +2134,20 @@ function buildHelpSections(): HelpSection[] {
         "2. #实时对话 添加 <QQ号>",
         "3. #实时对话 移除 <QQ号>",
         "4. #实时对话 间隔 <分钟>",
+      ],
+    },
+    {
+      title: "定时任务",
+      aliases: ["定时任务", "提醒", "reminder"],
+      lines: [
+        "1. @机器人 设置定时任务一个小时提醒群友喝水",
+        "2. #定时任务 列表",
+        "3. #定时任务 添加 每小时提醒群友喝水",
+        "4. #定时任务 修改 <任务ID> 每30分钟提醒群友喝水",
+        "5. #定时任务 删除 <任务ID>",
+        "6. #定时任务 状态 / 开启 / 关闭",
+        "作用：按固定间隔在当前群发送提醒，每次尽量换不同说法",
+        "限制：定时任务仅在工作日 9:00-18:00 范围内触发",
       ],
     },
     {
@@ -1357,11 +2199,14 @@ function buildHelpOverviewMessage(sections: HelpSection[]): string {
     "2. 技能：#技能 列表、#技能 切换 <skillId>",
     "3. 语音：#语音 <内容> 或 @机器人 语音说 <内容>",
     "4. 实时对话：#实时对话 列表、添加、移除、间隔 <分钟>",
-    "5. 日报：#日报 状态、发送、开启、关闭、时间 <HH:mm>",
-    "6. 节假日：#节假日、状态、发送、开启、关闭、时间 <HH:mm>",
-    "7. 管理员：#管理员 列表、添加 <QQ号>、移除 <QQ号>",
-    "8. 帮助：#功能、#帮助、#命令 都能调出本列表",
-    "分类帮助：#功能 对话 / 语音 / 技能 / 实时对话 / 日报 / 节假日 / 管理员 / 权限",
+    "5. 定时任务：#定时任务 列表、添加、修改、删除、状态、开启、关闭",
+    "6. 日报：#日报 状态、发送、开启、关闭、时间 <HH:mm>",
+    "7. 节假日：#节假日、状态、发送、开启、关闭、时间 <HH:mm>",
+    "8. 管理员：#管理员 列表、添加 <QQ号>、移除 <QQ号>",
+    "9. 闭嘴：#闭嘴 / #说话（管理员）",
+    "10. 帮助：#功能、#帮助、#命令 都能调出本列表",
+    "分类帮助：#功能 对话 / 语音 / 技能 / 实时对话 / 定时任务 / 日报 / 节假日 / 管理员 / 权限",
+    "定时任务限制：仅在工作日 9:00-18:00 范围内触发",
     "权限说明：普通成员可用对话、语音、帮助和部分查询；群管理员可用全部系统指令；超级管理员额外可管理管理员",
     "提示：#功能 / #帮助 / #命令 只会回帮助信息，不会主动触发日报或节假日发送",
     `可用分类：${sections.map((section) => section.title).join("、")}`,

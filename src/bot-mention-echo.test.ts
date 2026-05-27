@@ -116,9 +116,11 @@ class MemoryConversationStore {
     return [];
   }
 
-  async appendDialogue(_groupId: string, turns: ConversationTurn[]): Promise<void> {
+  async appendDialogue(_groupId: string, _userId: string, turns: ConversationTurn[]): Promise<void> {
     this.turns.push(...turns);
   }
+
+  async clearUser(): Promise<void> {}
 
   async clearGroup(): Promise<void> {}
 }
@@ -162,6 +164,15 @@ class DummyHolidayCountdownService {
   async markSent(): Promise<void> {}
 }
 
+class DummyScheduledReminderService {
+  parseCreateRequest(): undefined {
+    return undefined;
+  }
+  async getDueTasks(): Promise<[]> {
+    return [];
+  }
+}
+
 const skill: SkillDefinition = {
   id: "assistant",
   name: "assistant",
@@ -194,7 +205,7 @@ function createEvent(text: string): NapcatGroupMessageEvent {
   };
 }
 
-test("removes echoed qq ids from reply body when the user is already resolved as a real at mention", async () => {
+test("strips third-party mention echoes when explicit bot conversations do not at them", async () => {
   const transport = new MentionTransport([
     { user_id: 2236352543, nickname: "季博常", card: "季博常" },
   ]);
@@ -220,6 +231,7 @@ test("removes echoed qq ids from reply body when the user is already resolved as
     new UnusedTtsService() as never,
     new DummyDailyReportService() as never,
     new DummyHolidayCountdownService() as never,
+    new DummyScheduledReminderService() as never,
     new GroupLock(),
     new LiveChatService(),
     "12345",
@@ -228,6 +240,6 @@ test("removes echoed qq ids from reply body when the user is already resolved as
 
   await app.handleGroupMessage(createEvent(" @一下 2236352543 ，让他今晚一起去洗脚 "));
 
-  assert.equal(transport.sent[0]?.text, "[CQ:at,qq=2236352543] 这B 晚上怎么说 一起洗脚去 别装死");
-  assert.equal(conversationStore.turns[1]?.content, "这B 晚上怎么说 一起洗脚去 别装死");
+  assert.equal(transport.sent[0]?.text, "2236352543 这B 晚上怎么说 一起洗脚去 别装死");
+  assert.equal(conversationStore.turns[1]?.content, "2236352543 这B 晚上怎么说 一起洗脚去 别装死");
 });

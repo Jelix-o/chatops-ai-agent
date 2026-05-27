@@ -1,0 +1,276 @@
+import type { ScheduledReminderTask } from "../types.js";
+import type { AiService } from "./ai-service.js";
+import { ScheduledReminderStore } from "./scheduled-reminder-store.js";
+
+export interface ReminderCreateRequest {
+  intervalMinutes: number;
+  topic: string;
+}
+
+const MIN_INTERVAL_MINUTES = 1;
+const MAX_INTERVAL_MINUTES = 24 * 60;
+const WORK_START_HOUR = 9;
+const WORK_END_HOUR = 18;
+
+export class ScheduledReminderService {
+  constructor(
+    private readonly store: ScheduledReminderStore,
+    private readonly aiService: AiService,
+  ) {}
+
+  parseCreateRequest(input: string): ReminderCreateRequest | undefined {
+    const text = normalizeInput(input);
+    if (!/(?:设置|添加|创建|新建).{0,8}定时任务/.test(text) && !/^定时任务\s*(?:添加|设置|创建|新建)/.test(text)) {
+      return undefined;
+    }
+
+    const intervalMinutes = parseIntervalMinutes(text);
+    if (!intervalMinutes) {
+      return undefined;
+    }
+
+    const topic = extractTopic(text);
+    if (!topic) {
+      return undefined;
+    }
+
+    return {
+      intervalMinutes,
+      topic,
+    };
+  }
+
+  parseModifyRequest(input: string): { taskId: string; request: ReminderCreateRequest } | undefined {
+    const text = normalizeInput(input);
+    const match = text.match(/^(?:修改\s+)?(\S+)\s+(.+)$/);
+    if (!match) {
+      return undefined;
+    }
+
+    const taskId = match[1]!.trim();
+    const rest = match[2]!.trim();
+
+    const intervalMinutes = parseIntervalMinutes(rest);
+    if (!intervalMinutes) {
+      return undefined;
+    }
+
+    const topic = extractTopic(rest);
+    if (!topic) {
+      return undefined;
+    }
+
+    return { taskId, request: { intervalMinutes, topic } };
+  }
+
+  async createTask(args: {
+    groupId: string;
+    creatorUserId: string;
+    request: ReminderCreateRequest;
+    now?: Date;
+  }): Promise<ScheduledReminderTask> {
+    return this.store.addTask({
+      groupId: args.groupId,
+      creatorUserId: args.creatorUserId,
+      intervalMinutes: args.request.intervalMinutes,
+      topic: args.request.topic,
+      now: args.now,
+    });
+  }
+
+  async listGroupTasks(groupId: string): Promise<ScheduledReminderTask[]> {
+    return this.store.listGroupTasks(groupId);
+  }
+
+  async removeGroupTask(groupId: string, taskId: string): Promise<boolean> {
+    return this.store.removeGroupTask(groupId, taskId);
+  }
+
+  async getDueTasks(now = new Date()): Promise<ScheduledReminderTask[]> {
+    return this.store.getDueTasks(now);
+  }
+
+  async buildReminderMessage(task: ScheduledReminderTask): Promise<string> {
+    const message = await this.aiService.generateScheduledReminderText?.({
+      topic: task.topic,
+      groupId: task.groupId,
+      intervalMinutes: task.intervalMinutes,
+      recentMessages: task.recentMessages ?? [],
+    });
+
+    const body = normalizeReminderMessage(message) || buildFallbackReminderBody(task);
+    return `${buildReminderPrefix(task.topic)}${body}`;
+  }
+
+  async markSent(taskId: string, message: string, now = new Date()): Promise<void> {
+    const task = await this.store.markSent(taskId, message, now);
+    if (task) {
+      const nextRun = new Date(task.nextRunAt);
+      const adjusted = adjustToWorkHours(nextRun);
+      if (adjusted.getTime() !== nextRun.getTime()) {
+        await this.store.updateTask(taskId, { nextRunAt: adjusted.toISOString() });
+      }
+    }
+  }
+
+  async updateTask(
+    taskId: string,
+    updates: { intervalMinutes?: number; topic?: string },
+  ): Promise<ScheduledReminderTask | undefined> {
+    const nextRunAt = updates.intervalMinutes
+      ? adjustToWorkHours(new Date(Date.now() + updates.intervalMinutes * 60 * 1000)).toISOString()
+      : undefined;
+    return this.store.updateTask(taskId, { ...updates, nextRunAt });
+  }
+}
+
+export function formatIntervalLabel(minutes: number): string {
+  if (minutes % 60 === 0) {
+    const hours = minutes / 60;
+    return hours === 1 ? "1 小时" : `${hours} 小时`;
+  }
+
+  return `${minutes} 分钟`;
+}
+
+export function isWithinWorkHours(date: Date): boolean {
+  const day = date.getDay();
+  if (day === 0 || day === 6) {
+    return false;
+  }
+  const hour = date.getHours();
+  return hour >= WORK_START_HOUR && hour < WORK_END_HOUR;
+}
+
+export function adjustToWorkHours(date: Date): Date {
+  if (isWithinWorkHours(date)) {
+    return date;
+  }
+
+  const result = new Date(date);
+  result.setHours(WORK_START_HOUR, 0, 0, 0);
+
+  if (result <= date || !isWithinWorkHours(result)) {
+    do {
+      result.setDate(result.getDate() + 1);
+    } while (result.getDay() === 0 || result.getDay() === 6);
+    result.setHours(WORK_START_HOUR, 0, 0, 0);
+  }
+
+  return result;
+}
+
+function normalizeInput(input: string): string {
+  return input.replace(/\s+/g, " ").trim();
+}
+
+function parseIntervalMinutes(text: string): number | undefined {
+  const normalized = text.replace(/\s+/g, "");
+  const halfHourMatched = /半小时|半个小时/.test(normalized);
+  if (halfHourMatched) {
+    return 30;
+  }
+
+  const everyHourMatched = /每小时|每个小时/.test(normalized);
+  if (everyHourMatched) {
+    return 60;
+  }
+
+  const minuteMatch = normalized.match(/(?:每|间隔|每隔)?([一二两三四五六七八九十\d]+)分钟/);
+  if (minuteMatch) {
+    return clampInterval(parseChineseNumber(minuteMatch[1]));
+  }
+
+  const hourMatch = normalized.match(/(?:每|间隔|每隔)?([一二两三四五六七八九十\d]+)(?:个)?小时/);
+  if (hourMatch) {
+    const hours = parseChineseNumber(hourMatch[1]);
+    return clampInterval(hours ? hours * 60 : undefined);
+  }
+
+  return undefined;
+}
+
+function extractTopic(text: string): string | undefined {
+  const normalized = normalizeInput(text);
+  const remindMatch = normalized.match(/提醒(?:一下)?(?:群友|大家|所有人|全群|我们|我)?(.+)$/);
+  const topic = remindMatch?.[1]?.trim()
+    .replace(/^(?:去|要|该|记得|别忘了)\s*/, "")
+    .replace(/[。.!！?？]+$/g, "")
+    .trim();
+
+  if (topic) {
+    return topic.slice(0, 80);
+  }
+
+  const quotedMatch = normalized.match(/[“"']([^“”"']{1,80})[”"']/);
+  return quotedMatch?.[1]?.trim();
+}
+
+function parseChineseNumber(value: string | undefined): number | undefined {
+  if (!value) {
+    return undefined;
+  }
+
+  if (/^\d+$/.test(value)) {
+    return Number(value);
+  }
+
+  const digitMap: Record<string, number> = {
+    一: 1,
+    二: 2,
+    两: 2,
+    三: 3,
+    四: 4,
+    五: 5,
+    六: 6,
+    七: 7,
+    八: 8,
+    九: 9,
+  };
+
+  if (value === "十") {
+    return 10;
+  }
+
+  const tenParts = value.split("十");
+  if (tenParts.length === 2) {
+    const tens = tenParts[0] ? digitMap[tenParts[0]] : 1;
+    const ones = tenParts[1] ? digitMap[tenParts[1]] : 0;
+    if (tens !== undefined && ones !== undefined) {
+      return tens * 10 + ones;
+    }
+  }
+
+  return digitMap[value];
+}
+
+function clampInterval(minutes: number | undefined): number | undefined {
+  if (!minutes || !Number.isFinite(minutes)) {
+    return undefined;
+  }
+
+  return Math.min(MAX_INTERVAL_MINUTES, Math.max(MIN_INTERVAL_MINUTES, Math.round(minutes)));
+}
+
+function normalizeReminderMessage(message: string | null | undefined): string | undefined {
+  return message
+    ?.replace(/\s+/g, " ")
+    .replace(/^["“”']+|["“”']+$/g, "")
+    .trim()
+    .slice(0, 120);
+}
+
+function buildReminderPrefix(topic: string): string {
+  return `【提醒${topic}小助手】`;
+}
+
+function buildFallbackReminderBody(task: ScheduledReminderTask): string {
+  const variants = [
+    `到点了，群友们记得${task.topic}`,
+    `提醒一下大家，该${task.topic}了`,
+    `别光顾着聊天，大家${task.topic}安排上`,
+    `群友们，定时敲一下：记得${task.topic}`,
+  ];
+  const index = (task.recentMessages?.length ?? 0) % variants.length;
+  return variants[index]!;
+}

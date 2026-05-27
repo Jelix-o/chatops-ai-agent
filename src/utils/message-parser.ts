@@ -5,6 +5,7 @@ export interface ParsedGroupMessage {
   text: string;
   images: MessageImageInput[];
   mentionUserIds: string[];
+  replyMessageId?: string;
 }
 
 function normalizeText(text: string): string {
@@ -29,6 +30,26 @@ export function extractTextFromMessage(message: MessageSegment[] | string): stri
   }
 
   return normalizeText(parts.join(" "));
+}
+
+export function extractImagesFromMessage(message: MessageSegment[] | string): MessageImageInput[] {
+  if (typeof message === "string") {
+    return [];
+  }
+
+  const images: MessageImageInput[] = [];
+  for (const segment of message) {
+    if (typeof segment === "string") {
+      continue;
+    }
+
+    const imageInput = extractImageInput(segment);
+    if (imageInput) {
+      images.push(imageInput);
+    }
+  }
+
+  return images;
 }
 
 function extractImageUrl(segment: Exclude<MessageSegment, string>): string | undefined {
@@ -77,14 +98,22 @@ export function parseGroupMessage(
     const text = normalizeText(message);
     const escapedQq = escapeRegex(botQq);
     const cqAtPattern = new RegExp(`\\[CQ:at,qq=${escapedQq}(?:,[^\\]]*)?\\]`, "gi");
+    const cqReplyPattern = /\[CQ:reply,id=([^\],]+)(?:,[^\]]*)?\]/i;
     const plainAtPattern = new RegExp(`(^|\\s)@${escapedQq}\\b`, "g");
     const hasAtBot = cqAtPattern.test(text) || plainAtPattern.test(text);
+    const replyMessageId = text.match(cqReplyPattern)?.[1]?.trim();
+    const textWithoutReply = text.replace(cqReplyPattern, " ");
 
     return {
       hasAtBot,
-      text: normalizeText(text.replace(cqAtPattern, " ").replace(plainAtPattern, " ")),
+      text: normalizeText(
+        textWithoutReply
+          .replace(cqAtPattern, " ")
+          .replace(plainAtPattern, " "),
+      ),
       images: [],
-      mentionUserIds: extractMentionCandidatesFromText(text, botQq),
+      mentionUserIds: extractMentionCandidatesFromText(textWithoutReply, botQq),
+      replyMessageId,
     };
   }
 
@@ -92,6 +121,7 @@ export function parseGroupMessage(
   const parts: string[] = [];
   const images: MessageImageInput[] = [];
   const mentionUserIds: string[] = [];
+  let replyMessageId: string | undefined;
 
   for (const segment of message) {
     if (typeof segment === "string") {
@@ -106,6 +136,14 @@ export function parseGroupMessage(
       } else if (targetQq) {
         mentionUserIds.push(targetQq);
         parts.push(`@${targetQq}`);
+      }
+      continue;
+    }
+
+    if (segment.type === "reply") {
+      const id = String(segment.data?.id ?? "").trim();
+      if (id) {
+        replyMessageId = id;
       }
       continue;
     }
@@ -129,6 +167,7 @@ export function parseGroupMessage(
       mentionUserIds,
       extractMentionCandidatesFromText(parts.join(" "), botQq),
     ),
+    replyMessageId,
   };
 }
 

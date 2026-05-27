@@ -1,7 +1,16 @@
+import type { AiInteractionTarget, AiReplyContext } from "../types.js";
+
+export interface BufferedMessageContext {
+  interactionTargets?: AiInteractionTarget[];
+  replyContext?: AiReplyContext;
+}
+
 export interface BufferedMessage {
   text: string;
   userId: string;
   timestamp: string;
+  interactionTargets?: AiInteractionTarget[];
+  replyContext?: AiReplyContext;
 }
 
 export interface LiveChatWindowCandidate {
@@ -17,35 +26,50 @@ export class LiveChatService {
   private readonly buffers = new Map<string, BufferedMessage[]>();
   private readonly botActivities = new Map<string, number[]>();
   private readonly startedAt = Date.now();
+  private lastPruneTime = Date.now();
 
-  addMessage(groupId: string, userId: string, text: string, now = Date.now()): void {
+  addMessage(
+    groupId: string,
+    userId: string,
+    text: string,
+    now = Date.now(),
+    context: BufferedMessageContext = {},
+  ): void {
     const normalized = text.trim();
     if (!normalized) {
       return;
     }
 
     const key = buildKey(groupId, userId);
-    const nextMessages = [
-      ...(this.buffers.get(key) ?? []),
-      {
-        text: normalized,
-        userId,
-        timestamp: new Date(now).toISOString(),
-      },
-    ].filter((message) => toTimestamp(message.timestamp) >= now - MAX_BUFFER_WINDOW_MS);
+    const messages = this.buffers.get(key) ?? [];
+    messages.push({
+      text: normalized,
+      userId,
+      timestamp: new Date(now).toISOString(),
+      interactionTargets: context.interactionTargets,
+      replyContext: context.replyContext,
+    });
 
-    this.buffers.set(key, nextMessages);
-    this.prune(now);
+    const cutoff = now - MAX_BUFFER_WINDOW_MS;
+    while (messages.length > 0 && toTimestamp(messages[0]!.timestamp) < cutoff) {
+      messages.shift();
+    }
+
+    this.buffers.set(key, messages);
+    this.maybePrune(now);
   }
 
   recordBotActivity(groupId: string, now = Date.now()): void {
-    const nextActivities = [
-      ...(this.botActivities.get(groupId) ?? []),
-      now,
-    ].filter((timestamp) => timestamp >= now - MAX_BUFFER_WINDOW_MS);
+    const activities = this.botActivities.get(groupId) ?? [];
+    activities.push(now);
 
-    this.botActivities.set(groupId, nextActivities);
-    this.prune(now);
+    const cutoff = now - MAX_BUFFER_WINDOW_MS;
+    while (activities.length > 0 && activities[0]! < cutoff) {
+      activities.shift();
+    }
+
+    this.botActivities.set(groupId, activities);
+    this.maybePrune(now);
   }
 
   hasBotActivityBetween(groupId: string, startTime: number, endTime: number): boolean {
@@ -64,7 +88,7 @@ export class LiveChatService {
     startTime: number,
     endTime: number,
   ): LiveChatWindowCandidate | undefined {
-    const candidates: LiveChatWindowCandidate[] = [];
+    let bestCandidate: LiveChatWindowCandidate | undefined;
 
     for (const userId of trackedUserIds) {
       const messages = this.getMessagesBetween(groupId, userId, startTime, endTime);
@@ -72,16 +96,13 @@ export class LiveChatService {
         continue;
       }
 
-      candidates.push({
-        groupId,
-        userId,
-        messages,
-        lastTimestamp: messages[messages.length - 1]!.timestamp,
-      });
+      const lastTimestamp = messages[messages.length - 1]!.timestamp;
+      if (!bestCandidate || toTimestamp(lastTimestamp) > toTimestamp(bestCandidate.lastTimestamp)) {
+        bestCandidate = { groupId, userId, messages, lastTimestamp };
+      }
     }
 
-    candidates.sort((left, right) => toTimestamp(right.lastTimestamp) - toTimestamp(left.lastTimestamp));
-    return candidates[0];
+    return bestCandidate;
   }
 
   discardMessagesBefore(groupId: string, userId: string, cutoffTime: number): void {
@@ -111,24 +132,29 @@ export class LiveChatService {
     });
   }
 
-  private prune(now: number): void {
+  private maybePrune(now: number): void {
+    if (now - this.lastPruneTime < MAX_BUFFER_WINDOW_MS) {
+      return;
+    }
+
+    this.lastPruneTime = now;
     const minimumTime = now - MAX_BUFFER_WINDOW_MS;
 
     for (const [key, messages] of this.buffers.entries()) {
-      const remaining = messages.filter((message) => toTimestamp(message.timestamp) >= minimumTime);
-      if (remaining.length === 0) {
+      while (messages.length > 0 && toTimestamp(messages[0]!.timestamp) < minimumTime) {
+        messages.shift();
+      }
+      if (messages.length === 0) {
         this.buffers.delete(key);
-      } else {
-        this.buffers.set(key, remaining);
       }
     }
 
     for (const [groupId, timestamps] of this.botActivities.entries()) {
-      const remaining = timestamps.filter((timestamp) => timestamp >= minimumTime);
-      if (remaining.length === 0) {
+      while (timestamps.length > 0 && timestamps[0]! < minimumTime) {
+        timestamps.shift();
+      }
+      if (timestamps.length === 0) {
         this.botActivities.delete(groupId);
-      } else {
-        this.botActivities.set(groupId, remaining);
       }
     }
   }

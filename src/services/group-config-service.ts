@@ -1,9 +1,11 @@
 import { writeFile } from "node:fs/promises";
 
-import type { GroupBotConfig, GroupsConfigFile } from "../types.js";
+import type { GroupBotConfig, GroupManualIdentity, GroupsConfigFile } from "../types.js";
 import { readJsonFile } from "../utils/json-file.js";
 
 export class GroupConfigService {
+  private cachedConfig?: GroupsConfigFile;
+
   constructor(private readonly filePath: string) {}
 
   async getAll(): Promise<GroupBotConfig[]> {
@@ -167,6 +169,40 @@ export class GroupConfigService {
     return group;
   }
 
+  async updateBotMuted(groupId: string, muted: boolean): Promise<GroupBotConfig> {
+    const data = await this.readConfig();
+    const index = data.groups.findIndex((group) => group.groupId === groupId);
+    if (index === -1) {
+      throw new Error(`Group ${groupId} is not configured.`);
+    }
+
+    const group = normalizeGroupConfig({
+      ...data.groups[index],
+      botMuted: muted,
+    });
+    data.groups[index] = group;
+
+    await this.writeConfig(data);
+    return group;
+  }
+
+  async updateScheduledRemindersEnabled(groupId: string, enabled: boolean): Promise<GroupBotConfig> {
+    const data = await this.readConfig();
+    const index = data.groups.findIndex((group) => group.groupId === groupId);
+    if (index === -1) {
+      throw new Error(`Group ${groupId} is not configured.`);
+    }
+
+    const group = normalizeGroupConfig({
+      ...data.groups[index],
+      scheduledRemindersEnabled: enabled,
+    });
+    data.groups[index] = group;
+
+    await this.writeConfig(data);
+    return group;
+  }
+
   async getSuperAdminUserIds(): Promise<string[]> {
     const data = await this.readConfig();
     return [...(data.superAdminUserIds ?? [])];
@@ -210,11 +246,17 @@ export class GroupConfigService {
   }
 
   private async readConfig(): Promise<GroupsConfigFile> {
+    if (this.cachedConfig) {
+      return this.cachedConfig;
+    }
+
     const data = await readJsonFile<GroupsConfigFile>(this.filePath);
-    return normalizeGroupsConfigFile(data);
+    this.cachedConfig = normalizeGroupsConfigFile(data);
+    return this.cachedConfig;
   }
 
   private async writeConfig(data: GroupsConfigFile): Promise<void> {
+    this.cachedConfig = data;
     await writeFile(this.filePath, `${JSON.stringify(data, null, 2)}\n`, "utf8");
   }
 }
@@ -232,6 +274,7 @@ function normalizeGroupConfig(group: GroupBotConfig): GroupBotConfig {
     allowedSkillIds: Array.from(new Set(group.allowedSkillIds ?? [])),
     switcherUserIds: Array.from(new Set(group.switcherUserIds ?? [])),
     liveChatUserIds: Array.from(new Set(group.liveChatUserIds ?? [])),
+    manualIdentities: normalizeManualIdentities(group.manualIdentities),
     liveChatDelaySeconds: normalizeDelaySeconds(group.liveChatDelaySeconds),
     liveChatDelayMinutes: normalizeDelayMinutes(group.liveChatDelayMinutes),
     dailyReportEnabled: group.dailyReportEnabled !== false,
@@ -239,7 +282,47 @@ function normalizeGroupConfig(group: GroupBotConfig): GroupBotConfig {
     dailyReportTopUserCount: normalizeDailyReportTopUserCount(group.dailyReportTopUserCount),
     holidayCountdownEnabled: group.holidayCountdownEnabled !== false,
     holidayCountdownTime: normalizeHolidayCountdownTime(group.holidayCountdownTime),
+    botMuted: group.botMuted === true,
+    scheduledRemindersEnabled: group.scheduledRemindersEnabled !== false,
   };
+}
+
+function normalizeManualIdentities(value: GroupManualIdentity[] | undefined): GroupManualIdentity[] | undefined {
+  if (!Array.isArray(value)) {
+    return undefined;
+  }
+
+  const identities = value
+    .map((identity) => {
+      const userIds = Array.from(
+        new Set(
+          (identity.userIds ?? [])
+            .map((userId) => String(userId).trim())
+            .filter((userId) => /^\d+$/.test(userId)),
+        ),
+      );
+      const names = Array.from(
+        new Set(
+          (identity.names ?? [])
+            .map((name) => String(name).trim())
+            .filter(Boolean),
+        ),
+      );
+      const note = identity.note?.trim();
+
+      if (userIds.length === 0 || names.length === 0) {
+        return undefined;
+      }
+
+      return {
+        userIds,
+        names,
+        ...(note ? { note } : {}),
+      };
+    })
+    .filter((identity): identity is GroupManualIdentity => Boolean(identity));
+
+  return identities.length > 0 ? identities : undefined;
 }
 
 function normalizeDelaySeconds(value: number | undefined): number | undefined {

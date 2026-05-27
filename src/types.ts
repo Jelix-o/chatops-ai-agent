@@ -64,12 +64,55 @@ export interface MessageImageInput {
   summary?: string;
 }
 
+export interface ReferencedMessage {
+  messageId: string;
+  userId?: string;
+  userName?: string;
+  text: string;
+  images: MessageImageInput[];
+}
+
+export interface GroupManualIdentity {
+  userIds: string[];
+  names: string[];
+  note?: string;
+}
+
+export interface GroupMemberIdentity {
+  userId: string;
+  names: string[];
+}
+
+export interface AiInteractionTarget {
+  userId?: string;
+  names: string[];
+  source: "mention" | "reply";
+}
+
+export interface AiReplyContext {
+  messageId: string;
+  userId?: string;
+  userName?: string;
+  text: string;
+  images?: MessageImageInput[];
+}
+
+export interface AiIdentityContext {
+  groupId: string;
+  currentUserId: string;
+  botUserId?: string;
+  manualIdentities?: GroupManualIdentity[];
+  interactionTargets?: AiInteractionTarget[];
+  replyContext?: AiReplyContext;
+}
+
 export interface GroupBotConfig {
   groupId: string;
   currentSkillId: string;
   allowedSkillIds: string[];
   switcherUserIds: string[];
   liveChatUserIds: string[];
+  manualIdentities?: GroupManualIdentity[];
   liveChatDelaySeconds?: number;
   liveChatDelayMinutes?: number;
   dailyReportEnabled?: boolean;
@@ -77,6 +120,8 @@ export interface GroupBotConfig {
   dailyReportTopUserCount?: number;
   holidayCountdownEnabled?: boolean;
   holidayCountdownTime?: string;
+  botMuted?: boolean;
+  scheduledRemindersEnabled?: boolean;
 }
 
 export interface GroupsConfigFile {
@@ -100,6 +145,28 @@ export interface AiReply {
   text: string;
   model: string;
   skillId: string;
+}
+
+export interface ControlledMentionDecision {
+  shouldMention: boolean;
+  target?: string;
+  reason?: string;
+}
+
+export interface ScheduledReminderTask {
+  id: string;
+  groupId: string;
+  creatorUserId: string;
+  intervalMinutes: number;
+  topic: string;
+  createdAt: string;
+  nextRunAt: string;
+  enabled: boolean;
+  recentMessages?: string[];
+}
+
+export interface ScheduledRemindersFile {
+  tasks: Record<string, ScheduledReminderTask>;
 }
 
 export interface AppConfig {
@@ -126,4 +193,5 @@ export interface AppConfig {
   conversationsPath: string;
   dailyReportStorePath: string;
   holidayCountdownStorePath: string;
+  scheduledReminderStorePath: string;
 }

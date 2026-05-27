@@ -8,6 +8,8 @@ interface HolidayCountdownStoreFile {
 }
 
 export class HolidayCountdownStore {
+  private cachedData?: HolidayCountdownStoreFile;
+
   constructor(private readonly filePath: string) {}
 
   async getLastSentDate(groupId: string): Promise<string | undefined> {
@@ -22,23 +24,30 @@ export class HolidayCountdownStore {
   }
 
   private async readData(): Promise<HolidayCountdownStoreFile> {
+    if (this.cachedData) {
+      return this.cachedData;
+    }
+
     try {
       const data = await readJsonFile<HolidayCountdownStoreFile>(this.filePath);
-      return {
+      this.cachedData = {
         lastSentDateByGroup: data.lastSentDateByGroup ?? {},
       };
+      return this.cachedData;
     } catch (error) {
       const knownError = error as NodeJS.ErrnoException;
       if (knownError.code === "ENOENT") {
-        return {
+        this.cachedData = {
           lastSentDateByGroup: {},
         };
+        return this.cachedData;
       }
       throw error;
     }
   }
 
   private async writeData(data: HolidayCountdownStoreFile): Promise<void> {
+    this.cachedData = data;
     await mkdir(path.dirname(this.filePath), { recursive: true });
     await writeFile(this.filePath, `${JSON.stringify(data, null, 2)}\n`, "utf8");
   }

@@ -116,6 +116,8 @@ class MemoryConversationStore {
 
   async appendDialogue(): Promise<void> {}
 
+  async clearUser(): Promise<void> {}
+
   async clearGroup(): Promise<void> {}
 }
 
@@ -158,6 +160,15 @@ class DummyHolidayCountdownService {
   async markSent(): Promise<void> {}
 }
 
+class DummyScheduledReminderService {
+  parseCreateRequest(): undefined {
+    return undefined;
+  }
+  async getDueTasks(): Promise<[]> {
+    return [];
+  }
+}
+
 const skill: SkillDefinition = {
   id: "assistant",
   name: "assistant",
@@ -194,6 +205,7 @@ function createApp(replyText: string, members: NapcatGroupMember[]): {
     new UnusedTtsService() as never,
     new DummyDailyReportService() as never,
     new DummyHolidayCountdownService() as never,
+    new DummyScheduledReminderService() as never,
     new GroupLock(),
     new LiveChatService(),
     "12345",
@@ -225,34 +237,34 @@ function createEvent(text: string): NapcatGroupMessageEvent {
   };
 }
 
-test("resolves typed qq numbers through real group members before at-ing", async () => {
+test("does not at typed qq numbers in explicit bot conversations", async () => {
   const { app, transport } = createApp("收到，我去说", [
     { user_id: 55667788, nickname: "老张", card: "张三" },
   ]);
 
   await app.handleGroupMessage(createEvent(" 你和 55667788 说一声晚上开会 "));
 
-  assert.equal(transport.sent[0]?.text, "[CQ:at,qq=55667788] 收到，我去说");
+  assert.equal(transport.sent[0]?.text, "收到，我去说");
 });
 
-test("resolves plain-text nickname to the matching group member", async () => {
+test("does not at plain-text nicknames in explicit bot conversations", async () => {
   const { app, transport } = createApp("好，我去提醒他", [
     { user_id: 55667788, nickname: "老张", card: "张三" },
   ]);
 
   await app.handleGroupMessage(createEvent(" @老张 你跟他说别迟到 "));
 
-  assert.equal(transport.sent[0]?.text, "[CQ:at,qq=55667788] 好，我去提醒他");
+  assert.equal(transport.sent[0]?.text, "好，我去提醒他");
 });
 
-test("resolves plain-text group card to the matching group member", async () => {
+test("does not at plain-text group cards in explicit bot conversations", async () => {
   const { app, transport } = createApp("收到，我去转达", [
     { user_id: 67890, nickname: "小王", card: "项目经理" },
   ]);
 
   await app.handleGroupMessage(createEvent(" @项目经理 你和他说今晚收尾 "));
 
-  assert.equal(transport.sent[0]?.text, "[CQ:at,qq=67890] 收到，我去转达");
+  assert.equal(transport.sent[0]?.text, "收到，我去转达");
 });
 
 test("does not at unresolved names", async () => {

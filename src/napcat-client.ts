@@ -5,8 +5,16 @@ import { fileURLToPath } from "node:url";
 import WebSocket, { type RawData } from "ws";
 
 import { logError, logInfo, logWarn } from "./logger.js";
-import type { MessageImageInput, NapcatGroupMember, NapcatGroupMessageEvent } from "./types.js";
+import type {
+  MessageImageInput,
+  MessageSegment,
+  NapcatGroupMember,
+  NapcatGroupMessageEvent,
+  GroupMemberIdentity,
+  ReferencedMessage,
+} from "./types.js";
 import { resolveMentionTargetsFromMembers } from "./utils/mention-resolver.js";
+import { extractImagesFromMessage, extractTextFromMessage } from "./utils/message-parser.js";
 
 interface NapCatClientOptions {
   wsUrl: string;
@@ -24,6 +32,17 @@ interface NapCatActionResponse<TData = unknown> {
   retcode?: number;
   data?: TData;
   echo?: string;
+}
+
+interface NapCatGetMessageResponse {
+  message_id?: number | string;
+  sender?: {
+    user_id?: number | string;
+    nickname?: string;
+    card?: string;
+  };
+  message?: MessageSegment[] | string;
+  raw_message?: string;
 }
 
 export class NapCatClient extends EventEmitter<{ groupMessage: [NapcatGroupMessageEvent] }> {
@@ -119,6 +138,29 @@ export class NapCatClient extends EventEmitter<{ groupMessage: [NapcatGroupMessa
   async resolveMentionTargets(groupId: string, candidates: string[]): Promise<string[]> {
     const members = await this.getGroupMembers(groupId);
     return resolveMentionTargetsFromMembers(members, candidates);
+  }
+
+  async resolveMemberIdentities(
+    groupId: string,
+    candidates: string[],
+  ): Promise<GroupMemberIdentity[]> {
+    const members = await this.getGroupMembers(groupId);
+    const userIds = new Set(resolveMentionTargetsFromMembers(members, candidates));
+    return members
+      .filter((member) => userIds.has(String(member.user_id)))
+      .map((member) => ({
+        userId: String(member.user_id),
+        names: [member.card?.trim(), member.nickname?.trim(), String(member.user_id)].filter(
+          (name): name is string => Boolean(name),
+        ),
+      }));
+  }
+
+  async getMessage(messageId: string): Promise<ReferencedMessage | undefined> {
+    const data = await this.callHttpAction<NapCatGetMessageResponse>("get_msg", {
+      message_id: Number(messageId),
+    });
+    return toReferencedMessage(messageId, data);
   }
 
   async resolveImageInputs(images: MessageImageInput[]): Promise<MessageImageInput[]> {
@@ -358,4 +400,26 @@ function normalizeNapCatRecordFile(recordFile: string): string {
   }
 
   return recordFile.replace(/\\/g, "/");
+}
+
+function toReferencedMessage(
+  fallbackMessageId: string,
+  data: NapCatGetMessageResponse | undefined,
+): ReferencedMessage | undefined {
+  if (!data) {
+    return undefined;
+  }
+
+  const message = data.message ?? data.raw_message ?? "";
+  const userId = data.sender?.user_id === undefined ? undefined : String(data.sender.user_id);
+  const card = data.sender?.card?.trim();
+  const nickname = data.sender?.nickname?.trim();
+
+  return {
+    messageId: String(data.message_id ?? fallbackMessageId),
+    userId,
+    userName: card || nickname || userId,
+    text: extractTextFromMessage(message),
+    images: extractImagesFromMessage(message),
+  };
 }

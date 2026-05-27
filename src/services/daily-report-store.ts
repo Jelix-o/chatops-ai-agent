@@ -19,6 +19,8 @@ interface DailyReportStoreFile {
 const MAX_STORED_DAYS = 7;
 
 export class DailyReportStore {
+  private cachedData?: DailyReportStoreFile;
+
   constructor(private readonly filePath: string) {}
 
   async appendMessage(record: DailyReportMessageRecord): Promise<void> {
@@ -60,25 +62,32 @@ export class DailyReportStore {
   }
 
   private async readData(): Promise<DailyReportStoreFile> {
+    if (this.cachedData) {
+      return this.cachedData;
+    }
+
     try {
       const data = await readJsonFile<DailyReportStoreFile>(this.filePath);
-      return {
+      this.cachedData = {
         days: data.days ?? {},
         lastSentDateByGroup: data.lastSentDateByGroup ?? {},
       };
+      return this.cachedData;
     } catch (error) {
       const knownError = error as NodeJS.ErrnoException;
       if (knownError.code === "ENOENT") {
-        return {
+        this.cachedData = {
           days: {},
           lastSentDateByGroup: {},
         };
+        return this.cachedData;
       }
       throw error;
     }
   }
 
   private async writeData(data: DailyReportStoreFile): Promise<void> {
+    this.cachedData = data;
     await mkdir(path.dirname(this.filePath), { recursive: true });
     await writeFile(this.filePath, `${JSON.stringify(data, null, 2)}\n`, "utf8");
   }

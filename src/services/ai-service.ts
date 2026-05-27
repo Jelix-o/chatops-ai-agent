@@ -1,10 +1,18 @@
 import OpenAI from "openai";
 
 import { COMMON_PERSONA_CHAT_RULES } from "../persona/common-chat-behavior.js";
-import type { AiReply, ConversationTurn, MessageImageInput, SkillDefinition } from "../types.js";
+import type {
+  ControlledMentionDecision,
+  AiIdentityContext,
+  AiReply,
+  ConversationTurn,
+  MessageImageInput,
+  SkillDefinition,
+} from "../types.js";
 import type { BufferedMessage } from "./live-chat-service.js";
 
 type ChatMessage = OpenAI.Chat.Completions.ChatCompletionMessageParam;
+type ChatCompletionsClient = Pick<OpenAI.Chat.Completions, "create">;
 
 export interface DailyReportTopicInsight {
   title: string;
@@ -53,13 +61,16 @@ export interface ChatPeriodSummaryInput {
 
 export class AiService {
   private readonly client: OpenAI;
+  private readonly chatCompletions: ChatCompletionsClient;
 
   constructor(
     baseURL: string,
     apiKey: string,
     private readonly model: string,
+    chatCompletions?: ChatCompletionsClient,
   ) {
     this.client = new OpenAI({ baseURL, apiKey });
+    this.chatCompletions = chatCompletions ?? this.client.chat.completions;
   }
 
   async generateReply(args: {
@@ -67,9 +78,10 @@ export class AiService {
     history: ConversationTurn[];
     userInput: string;
     images?: MessageImageInput[];
+    identityContext?: AiIdentityContext;
   }): Promise<AiReply> {
-    const { skill, history, userInput, images = [] } = args;
-    const messages = buildChatMessages(skill, history, userInput, images);
+    const { skill, history, userInput, images = [], identityContext } = args;
+    const messages = buildChatMessages(skill, history, userInput, images, identityContext);
 
     // Some OpenAI-compatible gateways only provide text through stream chunks.
     const streamReply = await this.tryStreamReply(messages, skill.temperature);
@@ -81,7 +93,7 @@ export class AiService {
       };
     }
 
-    const completion = await this.client.chat.completions.create({
+    const completion = await this.chatCompletions.create({
       model: this.model,
       temperature: skill.temperature,
       messages,
@@ -126,7 +138,7 @@ export class AiService {
     ];
 
     try {
-      const completion = await this.client.chat.completions.create({
+      const completion = await this.chatCompletions.create({
         model: this.model,
         temperature: 0.3,
         messages,
@@ -140,6 +152,72 @@ export class AiService {
       return "SKIP";
     } catch {
       return "SKIP";
+    }
+  }
+
+  async evaluateControlledMention(args: {
+    skill: SkillDefinition;
+    history: ConversationTurn[];
+    userInput: string;
+    assistantReply: string;
+    identityContext: AiIdentityContext;
+  }): Promise<ControlledMentionDecision> {
+    const identities = args.identityContext.manualIdentities ?? [];
+    if (identities.length === 0) {
+      return { shouldMention: false, reason: "no manual identities" };
+    }
+
+    const identityLines = identities
+      .map((identity) => {
+        const qqList = identity.userIds.join(" / ");
+        const nameList = identity.names.join(" / ");
+        return `- ${qqList}: ${nameList}`;
+      })
+      .join("\n");
+    const historyText = args.history
+      .slice(-8)
+      .map((turn) => `[${turn.role === "assistant" ? args.skill.name : "群友"}] ${turn.content}`)
+      .join("\n");
+
+    const messages: ChatMessage[] = [
+      {
+        role: "system",
+        content: [
+          "你是 QQ 群机器人受控 @ 意图判定器。",
+          "只判断机器人在本轮回复中是否已经自主同意 @ 一名配置人员。",
+          "不要因为用户单方面要求就判定同意；必须结合机器人回复是否表达愿意叫人、帮忙喊人、同意 @ 对方。",
+          "只能选择人工身份表中的一个目标，不能选择未配置人员。",
+          "每次最多允许一个目标。",
+          "只输出 JSON，不要输出 markdown。",
+          '格式：{"shouldMention":true,"target":"名字或QQ","reason":"简短原因"} 或 {"shouldMention":false,"reason":"简短原因"}',
+        ].join("\n"),
+      },
+      {
+        role: "user",
+        content: [
+          `当前 skill: ${args.skill.name}`,
+          `当前群号: ${args.identityContext.groupId}`,
+          `当前发言人 QQ: ${args.identityContext.currentUserId}`,
+          `人工身份表:\n${identityLines}`,
+          historyText ? `最近上下文:\n${historyText}` : "最近上下文: 无",
+          `用户本轮输入:\n${args.userInput}`,
+          `机器人本轮回复:\n${args.assistantReply}`,
+          "请给出受控 @ 判定 JSON。",
+        ].join("\n\n"),
+      },
+    ];
+
+    try {
+      const completion = await this.chatCompletions.create({
+        model: this.model,
+        temperature: 0,
+        messages,
+        max_tokens: 120,
+      });
+      const text = completion.choices[0]?.message?.content?.trim() ?? "";
+      return parseControlledMentionDecision(text);
+    } catch {
+      return { shouldMention: false, reason: "decision failed" };
     }
   }
 
@@ -220,7 +298,7 @@ export class AiService {
     ];
 
     try {
-      const completion = await this.client.chat.completions.create({
+      const completion = await this.chatCompletions.create({
         model: this.model,
         temperature: 0.4,
         messages,
@@ -272,7 +350,7 @@ export class AiService {
     ];
 
     try {
-      const completion = await this.client.chat.completions.create({
+      const completion = await this.chatCompletions.create({
         model: this.model,
         temperature: 0.9,
         messages,
@@ -283,6 +361,55 @@ export class AiService {
       return text || fallback;
     } catch {
       return fallback;
+    }
+  }
+
+  async generateScheduledReminderText(args: {
+    topic: string;
+    groupId: string;
+    intervalMinutes: number;
+    recentMessages?: string[];
+  }): Promise<string | null> {
+    const recentText = (args.recentMessages ?? [])
+      .slice(-5)
+      .map((message, index) => `${index + 1}. ${message}`)
+      .join("\n");
+    const messages: ChatMessage[] = [
+      {
+        role: "system",
+        content: [
+          "你是 QQ 群定时提醒文案助手。",
+          "只输出一句中文提醒文案。",
+          "不要超过60个中文字符。",
+          "不要换行，不要引号，不要emoji，不要解释。",
+          "必须面向全体群友，使用'群友们''大家''各位'等群体称呼，不要针对单个人。",
+          "表达要自然、有变化，像群里熟人随口提醒。",
+          "如果提供了最近发送过的文案，本次不要复读同一句。",
+        ].join("\n"),
+      },
+      {
+        role: "user",
+        content: [
+          `群号: ${args.groupId}`,
+          `提醒频率: 每 ${args.intervalMinutes} 分钟`,
+          `提醒主题: ${args.topic}`,
+          recentText ? `最近已发文案:\n${recentText}` : "最近已发文案: 无",
+          "请生成本次提醒文案。",
+        ].join("\n"),
+      },
+    ];
+
+    try {
+      const completion = await this.chatCompletions.create({
+        model: this.model,
+        temperature: 0.9,
+        messages,
+        max_tokens: 100,
+      });
+
+      return normalizeBroadcastQuip(completion.choices[0]?.message?.content ?? "").slice(0, 120) || null;
+    } catch {
+      return null;
     }
   }
 
@@ -332,7 +459,7 @@ export class AiService {
     ];
 
     try {
-      const completion = await this.client.chat.completions.create({
+      const completion = await this.chatCompletions.create({
         model: this.model,
         temperature: 0.4,
         messages,
@@ -351,7 +478,7 @@ export class AiService {
     temperature: number,
   ): Promise<{ text: string; model: string } | null> {
     try {
-      const stream = await this.client.chat.completions.create({
+      const stream = await this.chatCompletions.create({
         model: this.model,
         temperature,
         messages,
@@ -385,6 +512,7 @@ export function buildChatMessages(
   history: ConversationTurn[],
   userInput: string,
   images: MessageImageInput[] = [],
+  identityContext?: AiIdentityContext,
 ): ChatMessage[] {
   const exampleMessages =
     skill.exampleExchanges?.flatMap((example) => [
@@ -403,7 +531,7 @@ export function buildChatMessages(
   return [
     {
       role: "system",
-      content: buildSystemPrompt(skill),
+      content: buildSystemPrompt(skill, identityContext),
     },
     ...exampleMessages,
     ...history.map((turn) => ({
@@ -516,6 +644,26 @@ function extractJsonObject(text: string): string | null {
   return raw.slice(start, end + 1);
 }
 
+function parseControlledMentionDecision(raw: string): ControlledMentionDecision {
+  const jsonText = extractJsonObject(raw);
+  if (!jsonText) {
+    return { shouldMention: false, reason: "no json" };
+  }
+
+  try {
+    const parsed = JSON.parse(jsonText) as Partial<ControlledMentionDecision>;
+    const target = typeof parsed.target === "string" ? parsed.target.trim() : undefined;
+    const reason = typeof parsed.reason === "string" ? parsed.reason.trim() : undefined;
+    return {
+      shouldMention: parsed.shouldMention === true,
+      ...(target ? { target } : {}),
+      ...(reason ? { reason } : {}),
+    };
+  } catch {
+    return { shouldMention: false, reason: "invalid json" };
+  }
+}
+
 function normalizeBroadcastQuip(text: string): string {
   return text
     .replace(/\r?\n/g, " ")
@@ -535,10 +683,13 @@ function normalizeChatPeriodSummary(text: string): string {
     .slice(0, 220);
 }
 
-export function buildSystemPrompt(skill: SkillDefinition): string {
+export function buildSystemPrompt(skill: SkillDefinition, identityContext?: AiIdentityContext): string {
   const commonChatBehavior = COMMON_PERSONA_CHAT_RULES.map((rule) => `- ${rule}`).join("\n");
   const style = skill.styleRules.map((rule) => `- ${rule}`).join("\n");
   const knowledge = skill.knowledge.map((item) => `- ${item}`).join("\n");
+  const runtimeContext = buildRuntimeContext(new Date());
+  const manualIdentityContext = buildManualIdentityContext(identityContext);
+  const interactionContext = buildInteractionContext(identityContext);
   const examples =
     skill.exampleExchanges?.length
       ? [
@@ -570,9 +721,132 @@ export function buildSystemPrompt(skill: SkillDefinition): string {
     "",
     "Known context:",
     knowledge,
+    "",
+    "Runtime context:",
+    runtimeContext,
+    manualIdentityContext ? ["", "Manual group identity memory:", manualIdentityContext].join("\n") : "",
+    interactionContext ? ["", "Current interaction context:", interactionContext].join("\n") : "",
     examples,
     sourceSkill,
   ].join("\n");
+}
+
+function buildManualIdentityContext(identityContext?: AiIdentityContext): string {
+  const identities = identityContext?.manualIdentities ?? [];
+  if (!identityContext || identities.length === 0) {
+    return "";
+  }
+
+  const lines = [
+    `- 当前群号：${identityContext.groupId}`,
+    `- 当前发言人 QQ：${identityContext.currentUserId}`,
+  ];
+
+  if (identityContext.botUserId) {
+    lines.push(`- 机器人自己的 QQ：${identityContext.botUserId}`);
+  }
+
+  lines.push(
+    "- 识别人时必须以 QQ 号为准，群名片、昵称和发言内容只作参考；如果有人使用别人的名字或外号发言，不要把他当成被冒充的人。",
+    "- 对已配置人员说话或提到他们时，优先使用身份表里的第一个名字作为主称呼，可自然使用后续别名；不要生硬直接称呼 QQ 号。",
+    "- 可以根据当前上下文、历史对话和群友称呼表现熟络、吐槽或带一点情绪，但不要凭空编造身份表没有提供的人物关系设定。",
+    "- 你拥有受控 @ 配置人员的能力：可以拒绝用户要求，也可以被说服后同意叫某个人；不要自己写 CQ @ 码，最终是否真正 @ 由程序校验。",
+    "- 下面是本群人工维护的身份表：",
+  );
+
+  for (const identity of identities) {
+    const qqList = identity.userIds.join(" / ");
+    const nameList = identity.names.join(" / ");
+    const note = identity.note ? `；${identity.note}` : "";
+    lines.push(`  - ${qqList}：${nameList}${note}`);
+  }
+
+  return lines.join("\n");
+}
+
+function buildInteractionContext(identityContext?: AiIdentityContext): string {
+  if (!identityContext) {
+    return "";
+  }
+
+  const lines = [
+    `- Current speaker QQ: ${identityContext.currentUserId}`,
+    "- Treat the following people as semantic context only. Do not output CQ at codes for third parties and do not write textual @ before their names.",
+    "- Identify people by QQ number and the manual identity table first. When referring to them, prefer the first configured/manual name, then aliases, then group card or nickname, and only use raw QQ when no name is known.",
+  ];
+
+  const targets = identityContext.interactionTargets ?? [];
+  if (targets.length > 0) {
+    lines.push("- Mentioned or replied people:");
+    for (const target of targets) {
+      const label = target.source === "reply" ? "replied-message sender" : "mentioned target";
+      const id = target.userId ? ` QQ ${target.userId}` : "";
+      const names = target.names.length > 0 ? ` names ${target.names.join(" / ")}` : "";
+      lines.push(`  - ${label}:${id}${names}`);
+    }
+  }
+
+  if (identityContext.replyContext) {
+    const reply = identityContext.replyContext;
+    const sender = [reply.userName, reply.userId ? `QQ ${reply.userId}` : ""]
+      .filter(Boolean)
+      .join(" ");
+    lines.push("- Referenced message:");
+    lines.push(`  - message id: ${reply.messageId}`);
+    lines.push(`  - sender: ${sender || "unknown"}`);
+    lines.push(`  - content: ${reply.text || "[non-text message]"}`);
+  }
+
+  return lines.join("\n");
+}
+
+function buildRuntimeContext(now: Date): string {
+  const timeZone = "Asia/Hong_Kong";
+  const parts = getTimeParts(now, timeZone);
+  const weekday = getWeekdayLabel(parts);
+
+  return [
+    `- 当前时间：${parts.year}-${parts.month}-${parts.day} ${parts.hour}:${parts.minute}:${parts.second} UTC+8`,
+    `- 当前日期：${parts.year}年${parts.month}月${parts.day}日 星期${weekday}`,
+    "- 当用户问今天、现在几点、星期几、日期或相对时间时，以这里的运行时上下文为准，不要凭训练数据猜。",
+  ].join("\n");
+}
+
+function getTimeParts(now: Date, timeZone: string): {
+  year: string;
+  month: string;
+  day: string;
+  hour: string;
+  minute: string;
+  second: string;
+} {
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hourCycle: "h23",
+  }).formatToParts(now);
+
+  const get = (type: string) => parts.find((part) => part.type === type)?.value ?? "00";
+  return {
+    year: get("year"),
+    month: get("month"),
+    day: get("day"),
+    hour: get("hour"),
+    minute: get("minute"),
+    second: get("second"),
+  };
+}
+
+function getWeekdayLabel(parts: { year: string; month: string; day: string }): string {
+  const weekdayIndex = new Date(
+    Date.UTC(Number(parts.year), Number(parts.month) - 1, Number(parts.day)),
+  ).getUTCDay();
+  return ["日", "一", "二", "三", "四", "五", "六"][weekdayIndex]!;
 }
 
 export function buildReplyDesireSystemPrompt(skill: SkillDefinition): string {

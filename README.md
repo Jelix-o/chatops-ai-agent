@@ -5,10 +5,12 @@
 它已经支持：
 
 - 群内 `@机器人` 才触发对话
+- 支持把群聊回复/引用消息作为 AI 参考，不改变原有触发规则
 - 多 skill 切换
 - 图片理解
 - MiMo TTS 语音回复
 - 实时对话
+- 群定时任务提醒
 - 群聊日报
 - 中国节假日倒计时
 - 群管理员 / 超级管理员权限体系
@@ -21,8 +23,10 @@
   - `@机器人 语音说 <内容>`
   - `#功能`
   - `#技能 列表`
+  - `#对话 清空`
   - `#日报 状态`
   - `#节假日`
+  - `#定时任务 列表`
 - 群管理员可使用全部系统指令：
   - skill 切换
   - 实时对话管理
@@ -38,9 +42,10 @@
 - `src/`：项目源码
 - `skills/`：技能人格配置
 - `config/groups.json`：群配置、管理员配置、超级管理员配置
-- `data/conversations.json`：群聊上下文
+- `data/conversations.json`：按 `groupId:userId` 保存的个人对话上下文
 - `data/daily-report-store.json`：日报发送状态
 - `data/holiday-countdown-store.json`：节假日倒计时发送状态
+- `data/scheduled-reminders.json`：群定时任务
 - `COMMANDS.md`：系统全部指令说明
 - `.env.example`：通用环境变量模板
 - `.env.server-2022.example`：Windows Server 2022 模板
@@ -147,7 +152,17 @@ copy .env.server-2022.example .env
       "dailyReportTime": "17:59",
       "dailyReportTopUserCount": 5,
       "holidayCountdownEnabled": true,
-      "holidayCountdownTime": "09:00"
+      "holidayCountdownTime": "09:00",
+      "manualIdentities": [
+        {
+          "userIds": ["1967410653"],
+          "names": ["小菜鸡", "前端哥"]
+        },
+        {
+          "userIds": ["927345463", "1551925371"],
+          "names": ["渣渣辉"]
+        }
+      ]
     }
   ]
 }
@@ -182,6 +197,10 @@ copy .env.server-2022.example .env
   - 是否开启节假日倒计时
 - `holidayCountdownTime`
   - 每天自动发送节假日倒计时的时间
+- `manualIdentities`
+  - 本群人工维护的身份记忆，用于 AI 对话时按 QQ 号识别成员
+  - `userIds` 支持一个身份绑定多个 QQ，`names` 支持多个常用称呼或外号
+  - AI 会以 QQ 号为准，昵称和群名片只作参考，减少冒充误判
 
 ## NapCat 接入
 
@@ -245,7 +264,7 @@ NapCat 里对应填写：
 
 完整指令清单请看：
 
-- [`COMMANDS.md`](/D:/development/AI-Project/COMMANDS.md)
+- [COMMANDS.md](COMMANDS.md)
 
 常用指令速览：
 
@@ -253,11 +272,14 @@ NapCat 里对应填写：
 - `#技能 列表`
 - `#技能 切换 <skillId>`
 - `#语音 <内容>`
+- `#对话 清空`
+- `#clear`
 - `#实时对话 列表`
 - `#实时对话 添加 <QQ号>`
 - `#日报 状态`
 - `#节假日`
 - `#管理员 列表`
+- `#闭嘴` / `#说话`
 
 ## Windows Server 2022 部署
 
@@ -311,6 +333,34 @@ powershell -ExecutionPolicy Bypass -File .\scripts\unregister-startup-task.ps1
 ```bash
 pnpm test
 ```
+
+## 对话与引用规则
+
+- 普通 `@机器人` 对话不自动 `@` 发言人，也不会自动 `@` 用户消息里提到的第三方。
+- 实时对话主动回复只会 `@` 被跟踪的发言人；如果该发言人消息里 `@` 了第三方，第三方只作为 AI 语义上下文。
+- `866209871` 群里普通消息包含“乘风”时会触发主动对话，机器人只会 `@` 发言人。
+- 群聊回复/引用消息会尝试通过 NapCat `get_msg` 读取原消息、发送者和图片概况，传给 AI 作为参考；读取失败不影响当前回复。
+- AI 正文里的第三方 `@QQ`、`@名字` 或 CQ at 会被降级成普通 QQ/名字，避免误触发第三方提醒。
+- `manualIdentities` 优先于群名片和昵称，用于识别被提到或被引用的人；回复时优先使用配置里的第一个名字，找不到配置时再使用群名片/昵称。
+- 配置了 `manualIdentities` 的群里，普通 `@机器人` 对话可触发受控 `@`：机器人先按人格决定是否愿意叫人，程序再按身份表唯一命中后最多 CQ `@` 1 人。
+- 同一个群最多并发处理 10 条消息；超过 10 条会排队，不再发送忙碌提示。
+
+## 定时任务
+
+- `@机器人 设置定时任务一个小时提醒群友喝水` 会在当前群创建每小时提醒任务。
+- `#定时任务 列表` 查看当前群任务。
+- `#定时任务 添加 每30分钟提醒群友站起来活动` 创建任务。
+- `#定时任务 删除 <任务ID>` 删除任务。
+- `#定时任务 关闭` 暂停当前群全部定时任务触发，不删除任务。
+- `#定时任务 开启` 恢复当前群全部定时任务触发。
+- `#定时任务 状态` 查看当前群定时任务总开关。
+- 定时提醒持久化在 `data/scheduled-reminders.json`，每次提醒会优先让 AI 换一种说法，失败时使用本地兜底文案。
+
+## 闭嘴模式
+
+- 群管理员或超级管理员可用 `#闭嘴` 让当前群机器人停止普通对话、语音、复读、乘风触发和实时对话。
+- 闭嘴后仍保留聊天总结、日报、节假日倒计时、定时任务提醒及这些功能的管理命令。
+- `#说话` 恢复当前群普通对话能力；闭嘴状态按群保存，不影响其他群。
 
 ## 分享项目给别人
 

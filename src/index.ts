@@ -11,6 +11,8 @@ import { GroupLock } from "./services/group-lock.js";
 import { HolidayCountdownService } from "./services/holiday-countdown-service.js";
 import { HolidayCountdownStore } from "./services/holiday-countdown-store.js";
 import { LiveChatService } from "./services/live-chat-service.js";
+import { ScheduledReminderService } from "./services/scheduled-reminder-service.js";
+import { ScheduledReminderStore } from "./services/scheduled-reminder-store.js";
 import { SkillService } from "./services/skill-service.js";
 import { TtsService } from "./services/tts-service.js";
 import { logError, logInfo } from "./logger.js";
@@ -59,6 +61,10 @@ async function main(): Promise<void> {
     ),
     new HolidayCountdownService(
       new HolidayCountdownStore(config.holidayCountdownStorePath),
+      aiService,
+    ),
+    new ScheduledReminderService(
+      new ScheduledReminderStore(config.scheduledReminderStorePath),
       aiService,
     ),
     new GroupLock(),

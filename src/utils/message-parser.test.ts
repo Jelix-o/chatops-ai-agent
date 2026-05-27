@@ -3,6 +3,29 @@ import assert from "node:assert/strict";
 
 import { parseGroupMessage } from "./message-parser.js";
 
+test("parseGroupMessage extracts reply segment ids without changing trigger rules", () => {
+  const result = parseGroupMessage(
+    [
+      { type: "reply", data: { id: "987654" } },
+      { type: "text", data: { text: " referenced only " } },
+    ],
+    "12345",
+  );
+
+  assert.equal(result.hasAtBot, false);
+  assert.equal(result.text, "referenced only");
+  assert.equal(result.replyMessageId, "987654");
+});
+
+test("parseGroupMessage extracts CQ reply ids from string messages", () => {
+  const result = parseGroupMessage("[CQ:reply,id=987654][CQ:at,qq=12345] hello", "12345");
+
+  assert.equal(result.hasAtBot, true);
+  assert.equal(result.text, "hello");
+  assert.equal(result.replyMessageId, "987654");
+  assert.deepEqual(result.mentionUserIds, []);
+});
+
 test("parseGroupMessage extracts text when bot is mentioned", () => {
   const result = parseGroupMessage(
     [
