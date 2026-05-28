@@ -122,6 +122,7 @@ export interface GroupBotConfig {
   holidayCountdownTime?: string;
   botMuted?: boolean;
   scheduledRemindersEnabled?: boolean;
+  blacklistedUserIds?: string[];
 }
 
 export interface GroupsConfigFile {

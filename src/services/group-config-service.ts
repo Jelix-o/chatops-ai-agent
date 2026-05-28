@@ -203,6 +203,36 @@ export class GroupConfigService {
     return group;
   }
 
+  async addBlacklistedUser(groupId: string, userId: string): Promise<GroupBotConfig> {
+    const data = await this.readConfig();
+    const index = data.groups.findIndex((group) => group.groupId === groupId);
+    if (index === -1) {
+      throw new Error(`Group ${groupId} is not configured.`);
+    }
+
+    const group = normalizeGroupConfig(data.groups[index]);
+    group.blacklistedUserIds = Array.from(new Set([...(group.blacklistedUserIds ?? []), userId]));
+    data.groups[index] = group;
+
+    await this.writeConfig(data);
+    return group;
+  }
+
+  async removeBlacklistedUser(groupId: string, userId: string): Promise<GroupBotConfig> {
+    const data = await this.readConfig();
+    const index = data.groups.findIndex((group) => group.groupId === groupId);
+    if (index === -1) {
+      throw new Error(`Group ${groupId} is not configured.`);
+    }
+
+    const group = normalizeGroupConfig(data.groups[index]);
+    group.blacklistedUserIds = (group.blacklistedUserIds ?? []).filter((item) => item !== userId);
+    data.groups[index] = group;
+
+    await this.writeConfig(data);
+    return group;
+  }
+
   async getSuperAdminUserIds(): Promise<string[]> {
     const data = await this.readConfig();
     return [...(data.superAdminUserIds ?? [])];
@@ -284,7 +314,22 @@ function normalizeGroupConfig(group: GroupBotConfig): GroupBotConfig {
     holidayCountdownTime: normalizeHolidayCountdownTime(group.holidayCountdownTime),
     botMuted: group.botMuted === true,
     scheduledRemindersEnabled: group.scheduledRemindersEnabled !== false,
+    blacklistedUserIds: normalizeUserIds(group.blacklistedUserIds),
   };
+}
+
+function normalizeUserIds(value: string[] | undefined): string[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+
+  return Array.from(
+    new Set(
+      value
+        .map((userId) => String(userId).trim())
+        .filter((userId) => /^\d+$/.test(userId)),
+    ),
+  );
 }
 
 function normalizeManualIdentities(value: GroupManualIdentity[] | undefined): GroupManualIdentity[] | undefined {

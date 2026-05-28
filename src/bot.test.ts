@@ -170,6 +170,18 @@ class FakeGroupConfigService {
     return cloneGroup(group);
   }
 
+  async addBlacklistedUser(groupId: string, userId: string): Promise<GroupBotConfig> {
+    const group = this.requireGroup(groupId);
+    group.blacklistedUserIds = Array.from(new Set([...(group.blacklistedUserIds ?? []), userId]));
+    return cloneGroup(group);
+  }
+
+  async removeBlacklistedUser(groupId: string, userId: string): Promise<GroupBotConfig> {
+    const group = this.requireGroup(groupId);
+    group.blacklistedUserIds = (group.blacklistedUserIds ?? []).filter((item) => item !== userId);
+    return cloneGroup(group);
+  }
+
   async getSuperAdminUserIds(): Promise<string[]> {
     return [...this.superAdminUserIds];
   }
@@ -411,6 +423,7 @@ function cloneGroup(group: GroupBotConfig): GroupBotConfig {
     allowedSkillIds: [...group.allowedSkillIds],
     switcherUserIds: [...group.switcherUserIds],
     liveChatUserIds: [...group.liveChatUserIds],
+    blacklistedUserIds: [...(group.blacklistedUserIds ?? [])],
     manualIdentities: group.manualIdentities?.map((identity) => ({
       ...identity,
       userIds: [...identity.userIds],
@@ -659,6 +672,101 @@ test("mute command requires admin permission", async () => {
 
   assert.equal(groupConfigService.groups[0]?.botMuted, undefined);
   assert.match(transport.sent[0]?.text ?? "", /没有/);
+});
+
+test("admin blacklist suppresses replies until unblocked while still recording reports", async () => {
+  const { app, transport, aiService, groupConfigService, dailyReportService } = createApp();
+
+  await app.handleGroupMessage(createEvent([{ type: "text", data: { text: "#拉黑 20001" } }], 99999));
+  assert.deepEqual(groupConfigService.groups[0]?.blacklistedUserIds, ["20001"]);
+  assert.match(transport.sent[0]?.text ?? "", /已拉黑 20001/);
+
+  await app.handleGroupMessage(
+    createEvent([
+      { type: "at", data: { qq: "12345" } },
+      { type: "text", data: { text: " 你好 " } },
+    ], 20001),
+  );
+  await app.handleGroupMessage(createEvent([{ type: "text", data: { text: "#语音 你好" } }], 20001));
+  await app.handleGroupMessage(createEvent([{ type: "text", data: { text: "普通消息" } }], 20001));
+  for (let index = 0; index < 5; index += 1) {
+    await app.handleGroupMessage(createEvent([{ type: "text", data: { text: "复读这句" } }], 20001));
+  }
+
+  assert.equal(aiService.calls.length, 0);
+  assert.equal(transport.sent.length, 1);
+  assert.equal(dailyReportService.recorded.length, 8);
+
+  await app.handleGroupMessage(createEvent([{ type: "text", data: { text: "#拉黑 解除 20001" } }], 99999));
+  assert.deepEqual(groupConfigService.groups[0]?.blacklistedUserIds, []);
+
+  await app.handleGroupMessage(
+    createEvent([
+      { type: "at", data: { qq: "12345" } },
+      { type: "text", data: { text: " 你好 " } },
+    ], 20001),
+  );
+
+  assert.equal(aiService.calls.length, 1);
+  assert.equal(transport.sent.at(-1)?.text, "AI reply");
+});
+
+test("blacklist command requires admin and blacklisted non-admin commands stay silent", async () => {
+  const groupConfigService = new FakeGroupConfigService([
+    {
+      groupId: "67890",
+      currentSkillId: "assistant",
+      allowedSkillIds: ["assistant"],
+      switcherUserIds: ["99999"],
+      liveChatUserIds: [],
+      liveChatDelayMinutes: 5,
+      dailyReportEnabled: true,
+      dailyReportTime: "18:00",
+      dailyReportTopUserCount: 3,
+      holidayCountdownEnabled: true,
+      holidayCountdownTime: "09:00",
+      blacklistedUserIds: ["20001"],
+    },
+  ]);
+  const { app, transport } = createApp({ groupConfigService });
+
+  await app.handleGroupMessage(createEvent([{ type: "text", data: { text: "#拉黑 20002" } }], 20003));
+  assert.match(transport.sent[0]?.text ?? "", /没有/);
+
+  await app.handleGroupMessage(createEvent([{ type: "text", data: { text: "#拉黑 解除 20001" } }], 20001));
+  await app.handleGroupMessage(createEvent([{ type: "text", data: { text: "#闭嘴" } }], 20001));
+
+  assert.equal(transport.sent.length, 1);
+  assert.deepEqual(groupConfigService.groups[0]?.blacklistedUserIds, ["20001"]);
+});
+
+test("blacklisted admin can unblock self but cannot run other commands while blocked", async () => {
+  const groupConfigService = new FakeGroupConfigService([
+    {
+      groupId: "67890",
+      currentSkillId: "assistant",
+      allowedSkillIds: ["assistant"],
+      switcherUserIds: ["99999"],
+      liveChatUserIds: [],
+      liveChatDelayMinutes: 5,
+      dailyReportEnabled: true,
+      dailyReportTime: "18:00",
+      dailyReportTopUserCount: 3,
+      holidayCountdownEnabled: true,
+      holidayCountdownTime: "09:00",
+      blacklistedUserIds: ["99999"],
+    },
+  ]);
+  const { app, transport } = createApp({ groupConfigService });
+
+  await app.handleGroupMessage(createEvent([{ type: "text", data: { text: "#拉黑 20001" } }], 99999));
+  assert.equal(transport.sent.length, 0);
+  assert.deepEqual(groupConfigService.groups[0]?.blacklistedUserIds, ["99999"]);
+
+  await app.handleGroupMessage(createEvent([{ type: "text", data: { text: "#拉黑 解除 99999" } }], 99999));
+
+  assert.deepEqual(groupConfigService.groups[0]?.blacklistedUserIds, []);
+  assert.match(transport.sent[0]?.text ?? "", /已解除拉黑 99999/);
 });
 
 test("handles up to ten same-group bot conversations concurrently and queues later messages", async () => {
