@@ -173,6 +173,13 @@ class DummyScheduledReminderService {
   }
 }
 
+class DummyAdminOperationLogService {
+  async record(): Promise<void> {}
+  async listRecent(): Promise<[]> {
+    return [];
+  }
+}
+
 const skill: SkillDefinition = {
   id: "assistant",
   name: "assistant",
@@ -232,6 +239,7 @@ test("strips third-party mention echoes when explicit bot conversations do not a
     new DummyDailyReportService() as never,
     new DummyHolidayCountdownService() as never,
     new DummyScheduledReminderService() as never,
+    new DummyAdminOperationLogService() as never,
     new GroupLock(),
     new LiveChatService(),
     "12345",

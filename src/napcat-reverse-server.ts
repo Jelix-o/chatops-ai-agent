@@ -5,6 +5,7 @@ import { URL } from "node:url";
 import WebSocket, { RawData, WebSocketServer } from "ws";
 
 import { logInfo, logWarn } from "./logger.js";
+import type { TransportHealthStatus } from "./bot.js";
 import type {
   GroupMemberIdentity,
   MessageSegment,
@@ -178,6 +179,16 @@ export class NapCatReverseServer extends EventEmitter<{ groupMessage: [NapcatGro
       message_id: Number(messageId),
     });
     return toReferencedMessage(messageId, response.data);
+  }
+
+  async getHealthStatus(): Promise<TransportHealthStatus> {
+    const connected = this.activeSocket?.readyState === WebSocket.OPEN;
+    return {
+      ok: connected,
+      detail: connected
+        ? `反向 WebSocket 已连接，监听 ${this.options.host}:${this.options.port}${this.options.path}`
+        : `反向 WebSocket 未连接，监听 ${this.options.host}:${this.options.port}${this.options.path}`,
+    };
   }
 
   private handleIncomingMessage(raw: string): void {

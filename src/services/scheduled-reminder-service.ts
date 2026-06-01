@@ -91,15 +91,19 @@ export class ScheduledReminderService {
   }
 
   async buildReminderMessage(task: ScheduledReminderTask): Promise<string> {
+    const prefix = buildReminderPrefix(task.topic);
+    const recentBodies = (task.recentMessages ?? [])
+      .map((message) => stripReminderPrefix(message, task.topic))
+      .filter(Boolean);
     const message = await this.aiService.generateScheduledReminderText?.({
       topic: task.topic,
       groupId: task.groupId,
       intervalMinutes: task.intervalMinutes,
-      recentMessages: task.recentMessages ?? [],
+      recentMessages: recentBodies,
     });
 
-    const body = normalizeReminderMessage(message) || buildFallbackReminderBody(task);
-    return `${buildReminderPrefix(task.topic)}${body}`;
+    const body = normalizeReminderMessage(message, task.topic) || buildFallbackReminderBody(task);
+    return normalizeReminderMessageWithPrefix(`${prefix}${body}`, task.topic);
   }
 
   async markSent(taskId: string, message: string, now = new Date()): Promise<void> {
@@ -252,12 +256,30 @@ function clampInterval(minutes: number | undefined): number | undefined {
   return Math.min(MAX_INTERVAL_MINUTES, Math.max(MIN_INTERVAL_MINUTES, Math.round(minutes)));
 }
 
-function normalizeReminderMessage(message: string | null | undefined): string | undefined {
-  return message
+function normalizeReminderMessage(message: string | null | undefined, topic: string): string | undefined {
+  const text = stripReminderPrefix(message, topic).slice(0, 120);
+  return text || undefined;
+}
+
+function stripReminderPrefix(message: string | null | undefined, topic: string): string {
+  const prefix = buildReminderPrefix(topic);
+  let text = message
     ?.replace(/\s+/g, " ")
-    .replace(/^["“”']+|["“”']+$/g, "")
-    .trim()
-    .slice(0, 120);
+    .replace(/^["“”'「『]+|["“”'」』]+$/g, "")
+    .trim() ?? "";
+
+  while (text.startsWith(prefix)) {
+    text = text.slice(prefix.length).trim();
+    text = text.replace(/^[:：,，.。;；\s]+/, "").trim();
+  }
+
+  return text;
+}
+
+function normalizeReminderMessageWithPrefix(message: string, topic: string): string {
+  const prefix = buildReminderPrefix(topic);
+  const body = stripReminderPrefix(message, topic);
+  return `${prefix}${body}`;
 }
 
 function buildReminderPrefix(topic: string): string {
@@ -270,6 +292,14 @@ function buildFallbackReminderBody(task: ScheduledReminderTask): string {
     `提醒一下大家，该${task.topic}了`,
     `别光顾着聊天，大家${task.topic}安排上`,
     `群友们，定时敲一下：记得${task.topic}`,
+    `各位，手头方便的话现在${task.topic}`,
+    `小提醒来了，大家抽个空${task.topic}`,
+    `该给自己续点状态了，大家${task.topic}`,
+    `群友们先停一秒，记得${task.topic}`,
+    `到提醒时间了，大家别忘了${task.topic}`,
+    `顺手提醒一下，能${task.topic}的现在安排一下`,
+    `各位别硬扛，先${task.topic}再继续聊`,
+    `时间到了，给大家提个醒：${task.topic}`,
   ];
   const index = (task.recentMessages?.length ?? 0) % variants.length;
   return variants[index]!;

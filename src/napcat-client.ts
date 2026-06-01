@@ -5,6 +5,7 @@ import { fileURLToPath } from "node:url";
 import WebSocket, { type RawData } from "ws";
 
 import { logError, logInfo, logWarn } from "./logger.js";
+import type { TransportHealthStatus } from "./bot.js";
 import type {
   MessageImageInput,
   MessageSegment,
@@ -166,6 +167,13 @@ export class NapCatClient extends EventEmitter<{ groupMessage: [NapcatGroupMessa
   async resolveImageInputs(images: MessageImageInput[]): Promise<MessageImageInput[]> {
     const resolved = await Promise.all(images.map((image) => this.resolveImageInput(image)));
     return resolved.filter((image): image is MessageImageInput => Boolean(image?.url));
+  }
+
+  async getHealthStatus(): Promise<TransportHealthStatus> {
+    return {
+      ok: this.isSocketOpen(),
+      detail: this.isSocketOpen() ? "WebSocket 已连接" : "WebSocket 未连接",
+    };
   }
 
   private handleMessage(raw: string): void {

@@ -79,6 +79,59 @@ test("ScheduledReminderService generates varied reminder text and falls back loc
   });
 });
 
+test("ScheduledReminderService strips duplicated reminder prefixes from ai text", async () => {
+  const cases = [
+    {
+      response: "【提醒喝水小助手】大家手边有水的话喝几口",
+      expected: "【提醒喝水小助手】大家手边有水的话喝几口",
+    },
+    {
+      response: "【提醒喝水小助手】【提醒喝水小助手】大家手边有水的话喝几口",
+      expected: "【提醒喝水小助手】大家手边有水的话喝几口",
+    },
+    {
+      response: "大家手边有水的话喝几口",
+      expected: "【提醒喝水小助手】大家手边有水的话喝几口",
+    },
+  ];
+
+  for (const item of cases) {
+    await withService(new FakeAiService(item.response), async (service) => {
+      const task = await service.createTask({
+        groupId: "67890",
+        creatorUserId: "20001",
+        request: { intervalMinutes: 60, topic: "喝水" },
+        now: new Date("2026-05-27T10:00:00.000Z"),
+      });
+
+      assert.equal(await service.buildReminderMessage(task), item.expected);
+    });
+  }
+});
+
+test("ScheduledReminderService sends prefix-free recent message bodies to ai", async () => {
+  const aiService = new FakeAiService("大家记得喝水");
+  await withService(aiService, async (service) => {
+    const task = await service.createTask({
+      groupId: "67890",
+      creatorUserId: "20001",
+      request: { intervalMinutes: 60, topic: "喝水" },
+      now: new Date("2026-05-27T10:00:00.000Z"),
+    });
+
+    await service.markSent(task.id, "【提醒喝水小助手】到点了，群友们记得喝水", new Date("2026-05-27T10:00:00.000Z"));
+    await service.markSent(task.id, "【提醒喝水小助手】【提醒喝水小助手】大家手边有水的话喝几口", new Date("2026-05-27T11:00:00.000Z"));
+    const updated = (await service.listGroupTasks("67890"))[0]!;
+
+    await service.buildReminderMessage(updated);
+
+    assert.deepEqual(aiService.calls[0]?.recentMessages, [
+      "到点了，群友们记得喝水",
+      "大家手边有水的话喝几口",
+    ]);
+  });
+});
+
 test("formatIntervalLabel formats hours and minutes", () => {
   assert.equal(formatIntervalLabel(60), "1 小时");
   assert.equal(formatIntervalLabel(120), "2 小时");

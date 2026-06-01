@@ -3,6 +3,7 @@ import { NapCatClient } from "./napcat-client.js";
 import { NapCatReverseServer } from "./napcat-reverse-server.js";
 import { BotApplication } from "./bot.js";
 import { AiService } from "./services/ai-service.js";
+import { AdminOperationLogService } from "./services/admin-operation-log-service.js";
 import { ConversationStore } from "./services/conversation-store.js";
 import { DailyReportService } from "./services/daily-report-service.js";
 import { DailyReportStore } from "./services/daily-report-store.js";
@@ -67,6 +68,7 @@ async function main(): Promise<void> {
       new ScheduledReminderStore(config.scheduledReminderStorePath),
       aiService,
     ),
+    new AdminOperationLogService(config.adminOperationLogPath),
     new GroupLock(),
     new LiveChatService(),
     config.botQq,

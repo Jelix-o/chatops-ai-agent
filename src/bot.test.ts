@@ -3,6 +3,7 @@ import { rm } from "node:fs/promises";
 import test from "node:test";
 
 import { BotApplication, type MessageTransport } from "./bot.js";
+import type { AdminOperationLogEntry } from "./services/admin-operation-log-service.js";
 import { GroupLock } from "./services/group-lock.js";
 import { LiveChatService } from "./services/live-chat-service.js";
 import { ScheduledReminderService } from "./services/scheduled-reminder-service.js";
@@ -33,6 +34,7 @@ class FakeTransport implements MessageTransport {
       { user_id: 20001, nickname: "Tester", card: "测试同学" },
     ],
   };
+  healthStatus = { ok: true, detail: "测试传输层已连接" };
 
   async sendGroupMessage(groupId: string, text: string): Promise<void> {
     this.sent.push({ groupId, text });
@@ -86,6 +88,10 @@ class FakeTransport implements MessageTransport {
       throw this.getMessageError;
     }
     return this.messagesById[messageId];
+  }
+
+  async getHealthStatus(): Promise<{ ok: boolean; detail: string }> {
+    return this.healthStatus;
   }
 }
 
@@ -401,6 +407,28 @@ class FakeHolidayCountdownService {
   }
 }
 
+class FakeAdminOperationLogService {
+  entries: AdminOperationLogEntry[] = [];
+
+  async record(entry: Omit<AdminOperationLogEntry, "timestamp"> & { timestamp?: string }): Promise<void> {
+    this.entries.push({
+      timestamp: entry.timestamp ?? new Date().toISOString(),
+      groupId: entry.groupId,
+      operatorUserId: entry.operatorUserId,
+      action: entry.action,
+      ...(entry.target ? { target: entry.target } : {}),
+      ...(entry.detail ? { detail: entry.detail } : {}),
+    });
+  }
+
+  async listRecent(groupId: string, limit = 10): Promise<AdminOperationLogEntry[]> {
+    return this.entries
+      .filter((entry) => entry.groupId === groupId)
+      .slice(-limit)
+      .reverse();
+  }
+}
+
 const assistantSkill: SkillDefinition = {
   id: "assistant",
   name: "assistant",
@@ -527,6 +555,7 @@ function createApp(options?: {
   dailyReportService?: FakeDailyReportService;
   holidayCountdownService?: FakeHolidayCountdownService;
   scheduledReminderService?: ScheduledReminderService;
+  adminOperationLogService?: FakeAdminOperationLogService;
   allowNapCatAiVoiceFallback?: boolean;
   skills?: SkillDefinition[];
 }): {
@@ -539,6 +568,7 @@ function createApp(options?: {
   dailyReportService: FakeDailyReportService;
   holidayCountdownService: FakeHolidayCountdownService;
   scheduledReminderService: ScheduledReminderService;
+  adminOperationLogService: FakeAdminOperationLogService;
 } {
   const transport = options?.transport ?? new FakeTransport();
   const groupConfigService =
@@ -583,6 +613,7 @@ function createApp(options?: {
       new ScheduledReminderStore(`data/test-scheduled-reminders-${Date.now()}-${Math.random()}.json`),
       aiService as never,
     );
+  const adminOperationLogService = options?.adminOperationLogService ?? new FakeAdminOperationLogService();
 
   const app = new BotApplication(
     transport,
@@ -594,6 +625,7 @@ function createApp(options?: {
     dailyReportService as never,
     holidayCountdownService as never,
     scheduledReminderService,
+    adminOperationLogService as never,
     new GroupLock(),
     new LiveChatService(),
     "12345",
@@ -610,6 +642,7 @@ function createApp(options?: {
     dailyReportService,
     holidayCountdownService,
     scheduledReminderService,
+    adminOperationLogService,
   };
 }
 
@@ -674,6 +707,119 @@ test("mute command requires admin permission", async () => {
   assert.match(transport.sent[0]?.text ?? "", /没有/);
 });
 
+test("admin status command summarizes current group controls", async () => {
+  const aiService = new FakeAiService(async () => ({
+    text: "AI reply",
+    model: "test-model",
+    skillId: "assistant",
+  }));
+  await withTestScheduledReminderService(aiService, async (scheduledReminderService) => {
+    const groupConfigService = new FakeGroupConfigService(
+      [
+        {
+          groupId: "67890",
+          currentSkillId: "assistant",
+          allowedSkillIds: ["assistant", "teacher"],
+          switcherUserIds: ["99999"],
+          liveChatUserIds: ["20001", "20002"],
+          liveChatDelaySeconds: 45,
+          liveChatDelayMinutes: 5,
+          dailyReportEnabled: false,
+          dailyReportTime: "18:00",
+          dailyReportTopUserCount: 3,
+          holidayCountdownEnabled: true,
+          holidayCountdownTime: "09:30",
+          scheduledRemindersEnabled: true,
+          botMuted: true,
+          blacklistedUserIds: ["30001"],
+        },
+      ],
+      ["1569671790"],
+    );
+    const { app, transport } = createApp({ groupConfigService, scheduledReminderService });
+
+    await app.handleGroupMessage(createEvent([{ type: "text", data: { text: "#定时任务 添加 每小时提醒群友喝水" } }], 99999));
+    await app.handleGroupMessage(createEvent([{ type: "text", data: { text: "#状态" } }], 99999));
+
+    const status = transport.sent.at(-1)?.text ?? "";
+    assert.match(status, /机器人状态：群 67890/);
+    assert.match(status, /说话：已闭嘴/);
+    assert.match(status, /当前技能：assistant（assistant）/);
+    assert.match(status, /实时对话：2 人，倒计时 45 秒/);
+    assert.match(status, /定时任务：已开启，1 个/);
+    assert.match(status, /群聊日报：已关闭/);
+    assert.match(status, /节假日倒计时：已开启，09:30/);
+    assert.match(status, /黑名单：1 人/);
+    assert.match(status, /管理员：本群 1 人，超级 1 人/);
+  });
+});
+
+test("status command requires admin permission", async () => {
+  const { app, transport } = createApp();
+
+  await app.handleGroupMessage(createEvent([{ type: "text", data: { text: "#状态" } }], 20001));
+
+  assert.match(transport.sent[0]?.text ?? "", /没有查看机器人状态的权限/);
+});
+
+test("admin health command summarizes transport and local configuration", async () => {
+  const transport = new FakeTransport();
+  transport.healthStatus = { ok: false, detail: "反向 WebSocket 未连接" };
+  const groupConfigService = new FakeGroupConfigService([
+    {
+      groupId: "67890",
+      currentSkillId: "missing",
+      allowedSkillIds: ["assistant", "missing"],
+      switcherUserIds: ["99999"],
+      liveChatUserIds: [],
+      dailyReportEnabled: true,
+      dailyReportTime: "18:00",
+      holidayCountdownEnabled: false,
+      scheduledRemindersEnabled: true,
+      blacklistedUserIds: ["30001"],
+    },
+  ]);
+  const { app } = createApp({ transport, groupConfigService, skills: [assistantSkill] });
+
+  await app.handleGroupMessage(createEvent([{ type: "text", data: { text: "#健康检查" } }], 99999));
+
+  const health = transport.sent.at(-1)?.text ?? "";
+  assert.match(health, /健康检查：群 67890/);
+  assert.match(health, /NapCat：异常，反向 WebSocket 未连接/);
+  assert.match(health, /当前技能：异常，找不到 missing/);
+  assert.match(health, /允许技能：异常，缺失 missing/);
+  assert.match(health, /定时任务：总开关已开启，0 个/);
+  assert.match(health, /节假日倒计时：已关闭/);
+});
+
+test("health command requires admin permission", async () => {
+  const { app, transport } = createApp();
+
+  await app.handleGroupMessage(createEvent([{ type: "text", data: { text: "#健康" } }], 20001));
+
+  assert.match(transport.sent[0]?.text ?? "", /没有查看机器人健康检查的权限/);
+});
+
+test("operation log command lists recent admin operations while muted", async () => {
+  const { app, transport, adminOperationLogService } = createApp();
+
+  await app.handleGroupMessage(createEvent([{ type: "text", data: { text: "#闭嘴" } }], 99999));
+  await app.handleGroupMessage(createEvent([{ type: "text", data: { text: "#操作日志" } }], 99999));
+
+  const logMessage = transport.sent.at(-1)?.text ?? "";
+  assert.equal(adminOperationLogService.entries.length, 1);
+  assert.match(logMessage, /最近管理员操作：/);
+  assert.match(logMessage, /99999 闭嘴/);
+});
+
+test("operation log command requires admin permission", async () => {
+  const { app, transport } = createApp();
+
+  await app.handleGroupMessage(createEvent([{ type: "text", data: { text: "#操作日志" } }], 20001));
+
+  assert.match(transport.sent[0]?.text ?? "", /没有查看机器人操作日志的权限/);
+});
+
 test("admin blacklist suppresses replies until unblocked while still recording reports", async () => {
   const { app, transport, aiService, groupConfigService, dailyReportService } = createApp();
 
@@ -689,13 +835,13 @@ test("admin blacklist suppresses replies until unblocked while still recording r
   );
   await app.handleGroupMessage(createEvent([{ type: "text", data: { text: "#语音 你好" } }], 20001));
   await app.handleGroupMessage(createEvent([{ type: "text", data: { text: "普通消息" } }], 20001));
-  for (let index = 0; index < 5; index += 1) {
+  for (let index = 0; index < 4; index += 1) {
     await app.handleGroupMessage(createEvent([{ type: "text", data: { text: "复读这句" } }], 20001));
   }
 
   assert.equal(aiService.calls.length, 0);
   assert.equal(transport.sent.length, 1);
-  assert.equal(dailyReportService.recorded.length, 8);
+  assert.equal(dailyReportService.recorded.length, 7);
 
   await app.handleGroupMessage(createEvent([{ type: "text", data: { text: "#拉黑 解除 20001" } }], 99999));
   assert.deepEqual(groupConfigService.groups[0]?.blacklistedUserIds, []);
@@ -983,16 +1129,16 @@ test("ignores non-mentioned messages for ai reply but still records daily stats"
   assert.equal(dailyReportService.recorded[0]?.text, "normal message");
 });
 
-test("repeats the same plain group text after more than four consecutive occurrences", async () => {
+test("repeats the same plain group text on the fourth consecutive occurrence", async () => {
   const { app, transport, aiService } = createApp();
 
-  for (let index = 0; index < 4; index += 1) {
+  for (let index = 0; index < 3; index += 1) {
     await app.handleGroupMessage(createEvent([{ type: "text", data: { text: "复读这句" } }], 20001 + index));
   }
 
   assert.equal(transport.sent.length, 0);
 
-  await app.handleGroupMessage(createEvent([{ type: "text", data: { text: "复读这句" } }], 20005));
+  await app.handleGroupMessage(createEvent([{ type: "text", data: { text: "复读这句" } }], 20004));
 
   assert.equal(aiService.calls.length, 0);
   assert.equal(transport.sent.length, 1);

@@ -195,4 +195,5 @@ export interface AppConfig {
   dailyReportStorePath: string;
   holidayCountdownStorePath: string;
   scheduledReminderStorePath: string;
+  adminOperationLogPath: string;
 }
